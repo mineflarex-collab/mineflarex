@@ -58,18 +58,33 @@ setup_locale() {
 }
 
 setup_theme() {
-  local tc=0
+  # MFX_COLOR=true|256|16 forces a mode. Default: auto-detect.
+  local mode="${MFX_COLOR:-auto}" tc=0 nc=0
   case "${COLORTERM:-}" in truecolor|24bit) tc=1 ;; esac
-  if (( tc )); then
-    P=$'\e[38;2;168;85;247m'          # #A855F7
-    SH=($'\e[38;2;233;213;254m' $'\e[38;2;216;180;254m' $'\e[38;2;192;132;252m' $'\e[38;2;168;85;247m' $'\e[38;2;147;51;234m')
-    BGC=$'\e[48;2;0;0;0m'
-  else
-    P=$'\e[38;5;135m'
-    SH=($'\e[38;5;189m' $'\e[38;5;183m' $'\e[38;5;177m' $'\e[38;5;135m' $'\e[38;5;98m')
-    BGC=$'\e[40m'
+  nc=$(tput colors 2>/dev/null || echo 0)
+  [[ $nc =~ ^[0-9]+$ ]] || nc=0
+  if [ "$mode" = auto ]; then
+    if (( tc )); then mode=true
+    elif (( nc >= 256 )); then mode=256
+    else mode=16; fi
   fi
-  WHT=$'\e[97m'; DIM=$'\e[90m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m'
+  case "$mode" in
+    true)
+      P=$'\e[38;2;168;85;247m'
+      SH=($'\e[38;2;233;213;254m' $'\e[38;2;216;180;254m' $'\e[38;2;192;132;252m' $'\e[38;2;168;85;247m' $'\e[38;2;147;51;234m')
+      BGC=$'\e[48;2;0;0;0m'
+      WHT=$'\e[97m'; DIM=$'\e[90m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+    256)
+      P=$'\e[38;5;135m'
+      SH=($'\e[38;5;189m' $'\e[38;5;183m' $'\e[38;5;177m' $'\e[38;5;135m' $'\e[38;5;98m')
+      BGC=$'\e[40m'
+      WHT=$'\e[97m'; DIM=$'\e[90m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+    *)  # basic 16-color terminals (no forced background)
+      P=$'\e[95m'
+      SH=($'\e[95m' $'\e[95m' $'\e[35m' $'\e[35m' $'\e[35m')
+      BGC=""
+      WHT=$'\e[97m'; DIM=$'\e[37m'; GRN=$'\e[92m'; RED=$'\e[91m'; YEL=$'\e[93m' ;;
+  esac
   BLD=$'\e[1m'
   RST=$'\e[0m'"$BGC"
 }
@@ -391,22 +406,12 @@ boot() {
   check "Checking root permission"  chk_root || boot_fail "$SPIN_OUT"
   init_log
 
-  spin_run "Detecting virtualization (LXC / KVM)" chk_virt; local rc=$?
-  if (( rc != 0 )); then
-    printf '  %s%s%s Virtualization check\n\n' "$RED" "$BAD" "$RST"
-    printf '%s%sERROR: KVM or LXC not found!%s\n' "$RED" "$BLD" "$RST"
-    printf '%sPlease enable KVM or LXC and try again.%s\n\n' "$RED" "$RST"
-    log "ERROR: KVM or LXC not found"
-    exit 1
-  fi
-  local t lst=()
-  read -ra lst <<<"$SPIN_OUT"
-  for t in "${lst[@]}"; do
-    printf '  %s%s%s %s%s FOUND%s\n' "$GRN" "$OK" "$RST" "$BLD" "$t" "$RST"
-    VIRT_LABEL+="${VIRT_LABEL:+ + }$t FOUND"
-    VIRT+="${VIRT:++}${t,,}"
-  done
-  log "Virtualization: $VIRT_LABEL"
+  # Virtualization is only detected silently (no error, no display).
+  VIRT=""
+  detect_lxc && VIRT="lxc"
+  detect_kvm && VIRT+="${VIRT:++}kvm"
+  VIRT_LABEL="${VIRT^^}"
+  log "Virtualization (info only): ${VIRT:-none}"
 
   check "Checking dependencies" ensure_deps || boot_fail "$SPIN_OUT"
   if ! check "Checking network" chk_net; then
@@ -612,7 +617,6 @@ screen_welcome() {
   box_blank
   box_row "OS      : $os" "$WHT"
   box_row "CPU     : $cpu core(s)    RAM: $ram    Free disk: $disk" "$WHT"
-  box_row "Virt    : $VIRT_LABEL" "$GRN"
   box_row "Log     : $LOG_FILE" "$DIM"
   box_bot
   printf '\n%*s%sPress any key to open the main menu...%s' "$PAD" '' "$DIM" "$RST"
@@ -626,8 +630,6 @@ draw_main_menu() {
   box_kv "[2]" "UPCOMING"      "Coming soon - not released"
   box_blank
   box_kv "[0]" "EXIT" ""
-  box_sep
-  box_row "Virtualization: $VIRT_LABEL" "$GRN"
   box_bot
   [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
   printf '\n%*s%sEnter choice [1-2, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
