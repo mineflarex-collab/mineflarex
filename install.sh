@@ -96,13 +96,13 @@ setup_theme() {
       SH=($'\e[38;2;221;200;255m' $'\e[38;2;196;150;255m' $'\e[38;2;181;101;255m' $'\e[38;2;157;64;245m' $'\e[38;2;131;40;220m')
       BGC=$'\e[48;2;10;5;22m'
       DIM=$'\e[38;2;160;145;200m'
-      WHT=$'\e[97m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+      WHT=$'\e[38;5;221m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
     256)
       P=$'\e[38;5;135m'
       SH=($'\e[38;5;189m' $'\e[38;5;183m' $'\e[38;5;177m' $'\e[38;5;141m' $'\e[38;5;135m')
       BGC=$'\e[40m'
       DIM=$'\e[38;5;103m'
-      WHT=$'\e[97m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+      WHT=$'\e[38;5;221m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
     mono)   # no colors at all (NO_COLOR / dumb terminals / user choice)
       P=""; SH=("" "" "" "" ""); BGC=""; DIM=""; WHT=""; GRN=""; RED=""; YEL="" ;;
     *)      # universal 8-color mode: ONLY plain 30-37 codes, no bold/bright
@@ -112,7 +112,7 @@ setup_theme() {
       SH=($'\e[35m' $'\e[35m' $'\e[35m' $'\e[35m' $'\e[35m')
       BGC=$'\e[40m'
       DIM=$'\e[36m'
-      WHT=$'\e[37m'; GRN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m' ;;
+      WHT=$'\e[33m'; GRN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m' ;;
   esac
   THEME_MODE=$mode
   case "$mode" in 16) BLD="" ;; mono) BLD=$'\e[1m'; [ "${TERM:-dumb}" = dumb ] && BLD="" ;; *) BLD=$'\e[1m' ;; esac
