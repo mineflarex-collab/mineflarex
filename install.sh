@@ -28,6 +28,8 @@ SPIN_OUT=""
 SPIN_RC=0
 FS=0
 THEME_MODE=16
+PREF_COLOR=""
+PREF_UNI=""
 BOOT_SOFT=0
 BOOT_TOTAL=5
 BOOT_DONE=0
@@ -45,6 +47,21 @@ cleanup() {
   [ -n "${TMP:-}" ] && rm -rf "$TMP"
 }
 
+load_prefs() {   # saved choices from the T / U keys
+  local f="$STATE_DIR/prefs" v
+  [ -r "$f" ] || return 0
+  v=$(sed -n 's/^COLOR=//p' "$f" 2>/dev/null | head -n1)
+  [[ $v =~ ^(16|256|true|mono)$ ]] && PREF_COLOR=$v
+  v=$(sed -n 's/^UNICODE=//p' "$f" 2>/dev/null | head -n1)
+  [[ $v =~ ^[01]$ ]] && PREF_UNI=$v
+  return 0
+}
+
+save_prefs() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  printf 'COLOR=%s\nUNICODE=%s\n' "${PREF_COLOR:-16}" "${PREF_UNI:-1}" >"$STATE_DIR/prefs" 2>/dev/null || true
+}
+
 setup_locale() {
   UTF=0
   case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
@@ -53,6 +70,7 @@ setup_locale() {
   if (( ! UTF )) && locale -a 2>/dev/null | grep -qi '^c\.utf'; then
     export LC_ALL=C.UTF-8; UTF=1
   fi
+  case "${MFX_UNICODE:-$PREF_UNI}" in 0) UTF=0 ;; esac
   if (( UTF )); then
     TL='╔'; TR='╗'; BL='╚'; BR='╝'; H='═'; V='║'; ML='╠'; MR='╣'
     BLK='█'; BARF='█'; BARE='░'; OK='✔'; BAD='✘'; ARW='▶'; WRN='!'
@@ -67,10 +85,10 @@ setup_locale() {
 setup_theme() {
   # Default = classic 8-color ANSI (30-37 + bold): works on EVERY terminal/SSH app.
   # Truecolor only when the terminal itself announces it (COLORTERM).
-  # Force a mode:  MFX_COLOR=true | 256 | 16
-  local mode="${MFX_COLOR:-auto}"
+  # Force a mode:  MFX_COLOR=true | 256 | 16 | mono   (or press T inside the installer)
+  local mode="${MFX_COLOR:-${PREF_COLOR:-auto}}"
   if [ "$mode" = auto ]; then
-    case "${COLORTERM:-}" in truecolor|24bit) mode=true ;; *) mode=16 ;; esac
+    if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-dumb}" = dumb ]; then mode=mono; else mode=16; fi
   fi
   case "$mode" in
     true)   # deep violet background + neon purple gradient
@@ -85,16 +103,19 @@ setup_theme() {
       BGC=$'\e[40m'
       DIM=$'\e[38;5;103m'
       WHT=$'\e[97m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
-    *)      # universal 8-color mode
+    mono)   # no colors at all (NO_COLOR / dumb terminals / user choice)
+      P=""; SH=("" "" "" "" ""); BGC=""; DIM=""; WHT=""; GRN=""; RED=""; YEL="" ;;
+    *)      # universal 8-color mode: ONLY plain 30-37 codes, no bold/bright
+            # (some terminal themes turn bold/bright colors white)
       mode=16
-      P=$'\e[1;35m'
-      SH=($'\e[1;37m' $'\e[1;35m' $'\e[1;35m' $'\e[35m' $'\e[35m')
+      P=$'\e[35m'
+      SH=($'\e[35m' $'\e[35m' $'\e[35m' $'\e[35m' $'\e[35m')
       BGC=$'\e[40m'
-      DIM=$'\e[37m'
-      WHT=$'\e[1;37m'; GRN=$'\e[1;32m'; RED=$'\e[1;31m'; YEL=$'\e[1;33m' ;;
+      DIM=$'\e[36m'
+      WHT=$'\e[37m'; GRN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m' ;;
   esac
   THEME_MODE=$mode
-  BLD=$'\e[1m'
+  case "$mode" in 16) BLD="" ;; mono) BLD=$'\e[1m'; [ "${TERM:-dumb}" = dumb ] && BLD="" ;; *) BLD=$'\e[1m' ;; esac
   RST=$'\e[0m'"$BGC"
 }
 
@@ -102,10 +123,14 @@ update_dims() {
   local sz r c
   sz=$(stty size </dev/tty 2>/dev/null) || sz=""
   r=${sz% *}; c=${sz#* }
+  [[ $r =~ ^[0-9]+$ ]] && (( r > 0 )) || r=$(tput lines 2>/dev/null)
+  [[ $c =~ ^[0-9]+$ ]] && (( c > 0 )) || c=$(tput cols 2>/dev/null)
+  [[ $r =~ ^[0-9]+$ ]] && (( r > 0 )) || r=${LINES:-24}
+  [[ $c =~ ^[0-9]+$ ]] && (( c > 0 )) || c=${COLUMNS:-80}
   [[ $r =~ ^[0-9]+$ ]] || r=24
   [[ $c =~ ^[0-9]+$ ]] || c=80
   ROWS=$r; COLS=$c
-  W=$((COLS - 2)); (( W > 90 )) && W=90; (( W < 40 )) && W=40
+  W=$((COLS - 2)); (( W > 90 )) && W=90; (( W < 28 )) && W=28
   PAD=$(( (COLS - W) / 2 )); (( PAD < 0 )) && PAD=0
 }
 
@@ -116,7 +141,13 @@ clear_screen() {   # [top_padding_lines]
   return 0
 }
 
-enter_fullscreen() { FS=1; printf '\e[?1049h%s\e[H\e[2J' "$RST"; }
+enter_fullscreen() {
+  if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ "${MFX_FULLSCREEN:-1}" != 0 ]; then
+    FS=1; printf '\e[?1049h%s\e[H\e[2J' "$RST"
+  else
+    FS=0
+  fi
+}
 leave_fullscreen() { (( FS )) && printf '\e[0m\e[?25h\e[?1049l'; FS=0; return 0; }
 
 rep() { local n=$2 s; (( n <= 0 )) && return 0; printf -v s '%*s' "$n" ''; printf '%s' "${s// /$1}"; }
@@ -211,7 +242,7 @@ build_logo() {
 }
 
 header_full() {
-  clear_screen "$(( (ROWS - (LOGO_H + 15)) / 2 ))"
+  clear_screen "$(( (ROWS - (LOGO_H + 17)) / 2 ))"
   box_top
   box_blank
   if (( W >= LOGO_W + 4 )); then
@@ -764,8 +795,23 @@ screen_welcome() {
   box_row "OS      : $os" "$WHT"
   box_row "CPU     : $cpu core(s)    RAM: $ram    Free disk: $disk" "$WHT"
   box_row "Log     : $LOG_FILE" "$DIM"
+  box_blank
+  box_row "Display looks wrong?  T = change colors   U = ASCII symbols" "$DIM"
   box_bot
   printf '\n%*s%sPress any key to open the main menu...%s' "$PAD" '' "$DIM" "$RST"
+}
+
+cycle_theme() {   # T key: 16 -> 256 -> true -> mono
+  local order=(16 256 true mono) i next=0
+  for i in "${!order[@]}"; do [ "${order[i]}" = "$THEME_MODE" ] && next=$(( (i + 1) % ${#order[@]} )); done
+  PREF_COLOR=${order[next]}; unset MFX_COLOR
+  setup_theme; build_logo; save_prefs
+}
+
+toggle_unicode() {   # U key: Unicode <-> plain ASCII symbols
+  if (( UTF )); then PREF_UNI=0; else PREF_UNI=1; fi
+  unset MFX_UNICODE
+  setup_locale; setup_theme; build_logo; save_prefs
 }
 
 draw_main_menu() {
@@ -776,6 +822,8 @@ draw_main_menu() {
   box_kv "[2]" "UPCOMING"      "Coming soon - not released"
   box_blank
   box_kv "[0]" "EXIT" ""
+  box_blank
+  box_row "T = colors (now: $THEME_MODE)   U = Unicode/ASCII symbols" "$DIM"
   box_bot
   [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
   printf '\n%*s%sEnter choice [1-2, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
@@ -793,6 +841,8 @@ main_menu() {
       1) module_bvm_bot ;;
       2) module_upcoming ;;
       0|q|Q) do_exit ;;
+      t|T) cycle_theme ;;
+      u|U) toggle_unicode ;;
       $'\e') drain_esc; MSG="Invalid input. Please press 1, 2 or 0." ;;
       "") MSG="Please press 1, 2 or 0." ;;
       *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Please press 1, 2 or 0." ;;
@@ -805,6 +855,7 @@ main() {
   trap cleanup EXIT
   trap 'exit 130' INT TERM
   trap 'RESIZED=1' WINCH
+  load_prefs
   setup_locale
   setup_theme
   update_dims
@@ -815,7 +866,14 @@ main() {
   boot
   REDRAW=screen_welcome
   screen_welcome
-  read_key || exit 0
+  while true; do
+    read_key || exit 0
+    case $KEY in
+      t|T) cycle_theme; screen_welcome ;;
+      u|U) toggle_unicode; screen_welcome ;;
+      *) break ;;
+    esac
+  done
   main_menu
 }
 
