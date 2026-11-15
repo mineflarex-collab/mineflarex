@@ -27,6 +27,7 @@ STAGE_DONE=0
 SPIN_OUT=""
 SPIN_RC=0
 FS=0
+THEME_MODE=16
 BOOT_SOFT=0
 BOOT_TOTAL=5
 BOOT_DONE=0
@@ -64,35 +65,35 @@ setup_locale() {
 }
 
 setup_theme() {
-  # MFX_COLOR=true|256|16 forces a mode. Default: auto-detect.
-  local mode="${MFX_COLOR:-auto}" tc=0 nc=0
-  case "${COLORTERM:-}" in truecolor|24bit) tc=1 ;; esac
-  nc=$(tput colors 2>/dev/null || echo 0)
-  [[ $nc =~ ^[0-9]+$ ]] || nc=0
+  # Default = classic 8-color ANSI (30-37 + bold): works on EVERY terminal/SSH app.
+  # Truecolor only when the terminal itself announces it (COLORTERM).
+  # Force a mode:  MFX_COLOR=true | 256 | 16
+  local mode="${MFX_COLOR:-auto}"
   if [ "$mode" = auto ]; then
-    if (( tc )); then mode=true
-    elif (( nc >= 256 )); then mode=256
-    else mode=16; fi
+    case "${COLORTERM:-}" in truecolor|24bit) mode=true ;; *) mode=16 ;; esac
   fi
   case "$mode" in
     true)   # deep violet background + neon purple gradient
       P=$'\e[38;2;181;101;255m'
       SH=($'\e[38;2;221;200;255m' $'\e[38;2;196;150;255m' $'\e[38;2;181;101;255m' $'\e[38;2;157;64;245m' $'\e[38;2;131;40;220m')
       BGC=$'\e[48;2;10;5;22m'
-      DIM=$'\e[38;2;160;145;200m' ;;
+      DIM=$'\e[38;2;160;145;200m'
+      WHT=$'\e[97m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
     256)
       P=$'\e[38;5;135m'
       SH=($'\e[38;5;189m' $'\e[38;5;183m' $'\e[38;5;177m' $'\e[38;5;141m' $'\e[38;5;135m')
       BGC=$'\e[40m'
-      DIM=$'\e[38;5;103m' ;;
-    *)      # basic 16-color terminals
-      P=$'\e[95m'
-      SH=($'\e[97m' $'\e[95m' $'\e[95m' $'\e[35m' $'\e[35m')
+      DIM=$'\e[38;5;103m'
+      WHT=$'\e[97m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+    *)      # universal 8-color mode
+      mode=16
+      P=$'\e[1;35m'
+      SH=($'\e[1;37m' $'\e[1;35m' $'\e[1;35m' $'\e[35m' $'\e[35m')
       BGC=$'\e[40m'
-      DIM=$'\e[37m' ;;
+      DIM=$'\e[37m'
+      WHT=$'\e[1;37m'; GRN=$'\e[1;32m'; RED=$'\e[1;31m'; YEL=$'\e[1;33m' ;;
   esac
-  WHT=$'\e[97m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m'
-  if [ "$mode" = 16 ]; then GRN=$'\e[92m'; RED=$'\e[91m'; YEL=$'\e[93m'; fi
+  THEME_MODE=$mode
   BLD=$'\e[1m'
   RST=$'\e[0m'"$BGC"
 }
@@ -621,7 +622,7 @@ git_fetch_repo() {  # repo dir  (clone if absent, fast-forward pull if it is alr
 }
 
 run_bot_installer() {
-  ( cd "$BOT_DIR" && chmod +x install.sh && env MFX_VIRT="$VIRT" MFX_LOG="$LOG_FILE" ./install.sh </dev/tty )
+  ( cd "$BOT_DIR" && chmod +x install.sh && env MFX_VIRT="$VIRT" MFX_LOG="$LOG_FILE" MFX_COLOR="$THEME_MODE" FORCE_COLOR=1 CLICOLOR_FORCE=1 ./install.sh </dev/tty )
 }
 
 # ----------------------------------------------------------------------------
