@@ -801,6 +801,32 @@ screen_welcome() {
   printf '\n%*s%sPress any key to open the main menu...%s' "$PAD" '' "$DIM" "$RST"
 }
 
+color_check() {   # first run only: ask whether this SSH client really shows colors
+  [ -n "${MFX_COLOR:-}" ] && return 0
+  [ -n "$PREF_COLOR" ] && return 0
+  [ -n "${NO_COLOR:-}" ] && return 0
+  [ "${TERM:-dumb}" = dumb ] && return 0
+  local r t1 t2 t3
+  r=$(( (ROWS - 9) / 2 + 1 )); (( r < 1 )) && r=1
+  t1="DISPLAY CHECK"
+  t2="Do you see colors on the line below?"
+  t3="PURPLE  GREEN  YELLOW  RED"
+  clear_screen 0
+  spl_line "$r" "${#t1}" "${P}${BLD}${t1}${RST}"
+  spl_line $(( r + 2 )) "${#t2}" "${WHT}${t2}${RST}"
+  spl_line $(( r + 4 )) "${#t3}" "${P}PURPLE${RST}  ${GRN}GREEN${RST}  ${YEL}YELLOW${RST}  ${RED}RED${RST}"
+  spl_line $(( r + 6 )) 38 "${WHT}Y = yes, I see colors${RST}"
+  spl_line $(( r + 7 )) 38 "${WHT}N = no, everything is white${RST}"
+  REDRAW=""
+  read_key || return 0
+  case $KEY in
+    y|Y) PREF_COLOR=16 ;;
+    *)   PREF_COLOR=mono ;;
+  esac
+  setup_theme; build_logo; save_prefs
+  clear_screen 0
+}
+
 cycle_theme() {   # T key: 16 -> 256 -> true -> mono
   local order=(16 256 true mono) i next=0
   for i in "${!order[@]}"; do [ "${order[i]}" = "$THEME_MODE" ] && next=$(( (i + 1) % ${#order[@]} )); done
@@ -863,6 +889,7 @@ main() {
   TMP=$(mktemp -d /tmp/mineflarex.XXXXXX) || { leave_fullscreen; echo "mktemp failed"; exit 1; }
   build_logo
   detect_pm || true
+  color_check
   boot
   REDRAW=screen_welcome
   screen_welcome
