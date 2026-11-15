@@ -26,6 +26,11 @@ STAGE_TOTAL=0
 STAGE_DONE=0
 SPIN_OUT=""
 SPIN_RC=0
+FS=0
+BOOT_SOFT=0
+BOOT_TOTAL=5
+BOOT_DONE=0
+SPL_BAR=0; SPL_STAT=0; SPL_CHK=0; SPL_N=0; SPL_PCT=0
 CUR_KEY=""; CUR_TITLE=""; CUR_FN=""; CUR_INFO=()
 
 # ----------------------------------------------------------------------------
@@ -34,6 +39,7 @@ CUR_KEY=""; CUR_TITLE=""; CUR_FN=""; CUR_INFO=()
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
 
 cleanup() {
+  leave_fullscreen 2>/dev/null
   printf '\e[?25h\e[0m' 2>/dev/null
   [ -n "${TMP:-}" ] && rm -rf "$TMP"
 }
@@ -69,22 +75,24 @@ setup_theme() {
     else mode=16; fi
   fi
   case "$mode" in
-    true)
-      P=$'\e[38;2;168;85;247m'
-      SH=($'\e[38;2;233;213;254m' $'\e[38;2;216;180;254m' $'\e[38;2;192;132;252m' $'\e[38;2;168;85;247m' $'\e[38;2;147;51;234m')
-      BGC=$'\e[48;2;0;0;0m'
-      WHT=$'\e[97m'; DIM=$'\e[90m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+    true)   # deep violet background + neon purple gradient
+      P=$'\e[38;2;181;101;255m'
+      SH=($'\e[38;2;221;200;255m' $'\e[38;2;196;150;255m' $'\e[38;2;181;101;255m' $'\e[38;2;157;64;245m' $'\e[38;2;131;40;220m')
+      BGC=$'\e[48;2;10;5;22m'
+      DIM=$'\e[38;2;160;145;200m' ;;
     256)
       P=$'\e[38;5;135m'
-      SH=($'\e[38;5;189m' $'\e[38;5;183m' $'\e[38;5;177m' $'\e[38;5;135m' $'\e[38;5;98m')
+      SH=($'\e[38;5;189m' $'\e[38;5;183m' $'\e[38;5;177m' $'\e[38;5;141m' $'\e[38;5;135m')
       BGC=$'\e[40m'
-      WHT=$'\e[97m'; DIM=$'\e[90m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
-    *)  # basic 16-color terminals (no forced background)
+      DIM=$'\e[38;5;103m' ;;
+    *)      # basic 16-color terminals
       P=$'\e[95m'
-      SH=($'\e[95m' $'\e[95m' $'\e[35m' $'\e[35m' $'\e[35m')
-      BGC=""
-      WHT=$'\e[97m'; DIM=$'\e[37m'; GRN=$'\e[92m'; RED=$'\e[91m'; YEL=$'\e[93m' ;;
+      SH=($'\e[97m' $'\e[95m' $'\e[95m' $'\e[35m' $'\e[35m')
+      BGC=$'\e[40m'
+      DIM=$'\e[37m' ;;
   esac
+  WHT=$'\e[97m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m'
+  if [ "$mode" = 16 ]; then GRN=$'\e[92m'; RED=$'\e[91m'; YEL=$'\e[93m'; fi
   BLD=$'\e[1m'
   RST=$'\e[0m'"$BGC"
 }
@@ -96,11 +104,19 @@ update_dims() {
   [[ $r =~ ^[0-9]+$ ]] || r=24
   [[ $c =~ ^[0-9]+$ ]] || c=80
   ROWS=$r; COLS=$c
-  W=$((COLS - 4)); (( W > 66 )) && W=66; (( W < 40 )) && W=40
+  W=$((COLS - 2)); (( W > 90 )) && W=90; (( W < 40 )) && W=40
   PAD=$(( (COLS - W) / 2 )); (( PAD < 0 )) && PAD=0
 }
 
-clear_screen() { printf '%s\e[H\e[2J\e[3J' "$RST"; }
+clear_screen() {   # [top_padding_lines]
+  local v=${1:-0}
+  printf '%s\e[H\e[2J\e[3J' "$RST"
+  (( v > 0 )) && printf '%*s' "$v" '' | tr ' ' '\n'
+  return 0
+}
+
+enter_fullscreen() { FS=1; printf '\e[?1049h%s\e[H\e[2J' "$RST"; }
+leave_fullscreen() { (( FS )) && printf '\e[0m\e[?25h\e[?1049l'; FS=0; return 0; }
 
 rep() { local n=$2 s; (( n <= 0 )) && return 0; printf -v s '%*s' "$n" ''; printf '%s' "${s// /$1}"; }
 
@@ -136,7 +152,7 @@ box_kv() {     # key label desc
 # ----------------------------------------------------------------------------
 #  Logo / headers
 # ----------------------------------------------------------------------------
-glyph() {
+glyph() {   # classic blocky font (ASCII fallback)
   case $1 in
     M) G=("#   #" "## ##" "# # #" "#   #" "#   #") ;;
     I) G=("#####" "  #  " "  #  " "  #  " "#####") ;;
@@ -150,23 +166,56 @@ glyph() {
   esac
 }
 
+sglyph() {  # smooth line-art font, 3 rows
+  case $1 in
+    M) G=("╔╦╗" "║║║" "╩ ╩") ;;
+    i) G=("╦" "║" "╩") ;;
+    n) G=("╔╗╔" "║║║" "╝╚╝") ;;
+    e) G=("╔═╗" "║╣ " "╚═╝") ;;
+    F) G=("╔═╗" "╠╣ " "╚  ") ;;
+    l) G=("╦  " "║  " "╩═╝") ;;
+    a) G=("╔═╗" "╠═╣" "╩ ╩") ;;
+    r) G=("╦═╗" "╠╦╝" "╩╚═") ;;
+    X) G=("═╗ ╦" "╔╩╦╝" "╩ ╚═") ;;
+  esac
+}
+
 build_logo() {
-  LOGO=(); local r ch line
-  for r in 0 1 2 3 4; do
-    line=""
-    for ch in M I N E F L A R E X; do glyph "$ch"; line+="${G[r]} "; done
-    line=${line% }
-    LOGO+=("${line//\#/$BLK}")
-  done
+  LOGO=(); LOGO_H=5; LOGO_W=59
+  local r ch line i n c idx out
+  if (( UTF )); then
+    LOGO_H=3
+    for r in 0 1 2; do
+      line=""
+      for ch in M i n e F l a r e X; do sglyph "$ch"; line+="${G[r]} "; done
+      LOGO+=("${line% }")
+    done
+    LOGO_W=${#LOGO[0]}
+    for r in 0 1 2; do          # left-to-right purple gradient
+      line=${LOGO[r]}; n=${#line}; out="$BLD"
+      for (( i = 0; i < n; i++ )); do
+        c=${line:i:1}
+        if [ "$c" = " " ]; then out+=" "; else out+="${SH[$(( i * 5 / n ))]}${c}"; fi
+      done
+      LOGO[r]="$out"
+    done
+  else
+    for r in 0 1 2 3 4; do
+      line=""
+      for ch in M I N E F L A R E X; do glyph "$ch"; line+="${G[r]} "; done
+      line=${line% }
+      LOGO+=("${SH[r]}${BLD}${line//\#/$BLK}")
+    done
+  fi
 }
 
 header_full() {
-  clear_screen
+  clear_screen "$(( (ROWS - (LOGO_H + 15)) / 2 ))"
   box_top
   box_blank
-  if (( W >= 61 )); then
+  if (( W >= LOGO_W + 4 )); then
     local r
-    for r in 0 1 2 3 4; do box_raw_c "${SH[r]}${BLD}${LOGO[r]}${RST}" 59; done
+    for (( r = 0; r < LOGO_H; r++ )); do box_raw_c "${LOGO[r]}${RST}" "$LOGO_W"; done
   else
     box_center "M I N E F L A R E X" "$P$BLD"
   fi
@@ -216,7 +265,12 @@ ask_yn() {
 # ----------------------------------------------------------------------------
 #  Spinner / progress engine (progress % = completed real stages)
 # ----------------------------------------------------------------------------
-bar() { local pct=$1 w=${2:-20} f; f=$(( pct * w / 100 )); printf '%s%s%s%s%s' "$P" "$(rep "$BARF" "$f")" "$DIM" "$(rep "$BARE" $(( w - f )))" "$RST"; }
+bar() {   # pct [width]  - purple gradient fill
+  local pct=$1 w=${2:-20} f i out=""
+  f=$(( pct * w / 100 ))
+  for (( i = 0; i < f; i++ )); do out+="${SH[$(( 4 - i * 5 / w ))]}${BARF}"; done
+  printf '%s%s%s%s' "$out" "$DIM" "$(rep "$BARE" $(( w - f )))" "$RST"
+}
 
 spin_run() {   # label cmd...   (cmd runs in background; stdout captured in SPIN_OUT)
   local label=$1; shift
@@ -391,33 +445,125 @@ init_log() {
   log "MineFlareX v$MFX_VERSION started on $(uname -srm)"
 }
 
+# ----------------------------------------------------------------------------
+#  Loading screen (full screen, real progress)
+# ----------------------------------------------------------------------------
+spl_line() {   # row visible_len colored_text   (centered, full-line repaint)
+  local pad=$(( (COLS - $2) / 2 ))
+  (( pad < 0 )) && pad=0
+  printf '\e[%d;1H\e[2K%*s%s%s' "$1" "$pad" '' "$3" "$RST"
+}
+
+spl_bar() {    # pct
+  local pct=$1 bw=$(( COLS - 14 )) f
+  (( bw > 48 )) && bw=48; (( bw < 16 )) && bw=16
+  f=$(( pct * bw / 100 ))
+  spl_line "$SPL_BAR" $(( bw + 5 )) "$(printf '%s %s%3d%%%s' "$(bar "$pct" "$bw")" "$WHT$BLD" "$pct" "$RST")"
+}
+
+spl_bar_to() { # target pct (smooth animation)
+  local t=$1
+  while (( SPL_PCT < t )); do
+    SPL_PCT=$(( SPL_PCT + 2 )); (( SPL_PCT > t )) && SPL_PCT=$t
+    spl_bar "$SPL_PCT"; sleep 0.012
+  done
+}
+
+spl_status() { # glyph text
+  spl_line "$SPL_STAT" $(( ${#2} + 2 )) "${P}${BLD}$1${RST} ${WHT}$2${RST}"
+}
+
+spl_check() {  # rc label detail
+  local rc=$1 label=$2 detail=$3 bw=$(( COLS - 6 )) col mark c lab room
+  (( bw > 58 )) && bw=58
+  col=$(( (COLS - bw) / 2 + 1 )); (( col < 1 )) && col=1
+  if (( rc == 0 )); then mark=$OK; c=$GRN
+  elif (( BOOT_SOFT )); then mark=$WRN; c=$YEL
+  else mark=$BAD; c=$RED; fi
+  printf -v lab '%-26s' "$label"
+  room=$(( bw - ${#mark} - 1 - 26 - 1 )); (( room < 0 )) && room=0
+  detail=${detail:0:$room}
+  printf '\e[%d;1H\e[2K\e[%d;%dH%s%s%s %s%s%s %s%s%s' \
+    "$(( SPL_CHK + SPL_N ))" "$(( SPL_CHK + SPL_N ))" "$col" \
+    "$c" "$mark" "$RST" "$WHT" "$lab" "$RST" "$DIM" "$detail" "$RST"
+  SPL_N=$(( SPL_N + 1 ))
+}
+
+splash_init() {
+  local L=$LOGO_H total r i v rw out
+  (( COLS < LOGO_W + 4 )) && L=1
+  total=$(( L + 12 ))
+  r=$(( (ROWS - total) / 2 + 1 )); (( r < 1 )) && r=1
+  clear_screen 0
+  printf '\e[?25l'
+  if (( L == LOGO_H )); then
+    for (( i = 0; i < L; i++ )); do spl_line $(( r + i )) "$LOGO_W" "${LOGO[i]}${RST}"; sleep 0.07; done
+  else
+    spl_line "$r" 19 "${P}${BLD}M I N E F L A R E X${RST}"
+  fi
+  r=$(( r + L + 1 ))
+  spl_line "$r" 33 "${WHT}Advanced VPS & Hosting Management${RST}"
+  v="v$MFX_VERSION  |  mineflarex.indevs.in"
+  spl_line $(( r + 1 )) "${#v}" "${DIM}${v}${RST}"
+  rw=$(( COLS - 8 )); (( rw > 40 )) && rw=40; (( rw < 12 )) && rw=12
+  out=""
+  for (( i = 0; i < rw; i++ )); do out+="${SH[$(( i * 5 / rw ))]}${H}"; done
+  spl_line $(( r + 2 )) "$rw" "$out"
+  SPL_BAR=$(( r + 3 )); SPL_STAT=$(( r + 4 )); SPL_CHK=$(( r + 6 ))
+  SPL_PCT=0; SPL_N=0
+  spl_bar 0
+}
+
+boot_step() {  # label cmd...   (runs in background, spinner + real progress)
+  local label=$1; shift
+  local outf pid i=0 frames=0 rc first
+  outf=$(mktemp "$TMP/out.XXXXXX")
+  "$@" >"$outf" 2>>"$LOG_FILE" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null || (( frames < 6 )); do
+    spl_status "${SPIN[i % ${#SPIN[@]}]}" "$label"
+    i=$(( i + 1 )); frames=$(( frames + 1 )); sleep 0.07
+  done
+  wait "$pid"; rc=$?
+  SPIN_OUT=$(<"$outf"); rm -f "$outf"
+  first=${SPIN_OUT%%$'\n'*}
+  log "boot '$label' rc=$rc ${first}"
+  if (( rc != 0 && BOOT_SOFT )); then first="offline"; fi
+  spl_check "$rc" "$label" "$first"
+  BOOT_DONE=$(( BOOT_DONE + 1 ))
+  spl_bar_to $(( BOOT_DONE * 100 / BOOT_TOTAL ))
+  return "$rc"
+}
+
+chk_sys() { ( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux} ($(uname -m))" ); }
+
 boot_fail() {
-  printf '\n  %s%sERROR:%s %s\n\n' "$RED" "$BLD" "$RST" "$1"
+  leave_fullscreen
+  printf '\n  %s%sERROR:%s %s\n\n' "$RED" "$BLD" $'\e[0m' "$1"
   log "BOOT FAIL: $1"
   exit 1
 }
 
 boot() {
-  header_full
-  box_center "Initializing MineFlareX..." "$P"
-  box_bot
-  printf '\n'
-  check "Checking environment"      chk_env  || boot_fail "$SPIN_OUT"
-  check "Checking root permission"  chk_root || boot_fail "$SPIN_OUT"
+  BOOT_TOTAL=5; BOOT_DONE=0
+  splash_init
+  boot_step "Checking environment"     chk_env  || boot_fail "$SPIN_OUT"
+  boot_step "Checking root permission" chk_root || boot_fail "$SPIN_OUT"
   init_log
-
-  # Virtualization is only detected silently (no error, no display).
+  # Virtualization is detected silently (info only - never an error, never shown)
   VIRT=""
   detect_lxc && VIRT="lxc"
   detect_kvm && VIRT+="${VIRT:++}kvm"
   VIRT_LABEL="${VIRT^^}"
   log "Virtualization (info only): ${VIRT:-none}"
-
-  check "Checking dependencies" ensure_deps || boot_fail "$SPIN_OUT"
-  if ! check "Checking network" chk_net; then
-    printf '    %s%s Network check failed - downloads may fail later%s\n' "$YEL" "$WRN" "$RST"
-  fi
-  sleep 0.6
+  boot_step "Detecting system"         chk_sys  || true
+  boot_step "Checking dependencies"    ensure_deps || boot_fail "$SPIN_OUT"
+  BOOT_SOFT=1
+  boot_step "Checking network"         chk_net  || log "network check failed - downloads may fail later"
+  BOOT_SOFT=0
+  spl_line "$SPL_STAT" $(( ${#OK} + 1 + 5 )) "${GRN}${BLD}${OK}${RST} ${WHT}${BLD}Ready${RST}"
+  sleep 0.7
+  printf '\e[?25h'
 }
 
 # ----------------------------------------------------------------------------
@@ -534,9 +680,8 @@ view_log() {
 }
 
 do_exit() {
-  clear_screen
-  box_top; box_center "Thanks for using MineFlareX" "$P$BLD"; box_center "Log: $LOG_FILE" "$DIM"; box_bot
-  printf '\n'
+  leave_fullscreen
+  printf '\n  %s%sThanks for using MineFlareX%s\n  Log: %s\n\n' "$P" "$BLD" $'\e[0m' "$LOG_FILE"
   exit 0
 }
 
@@ -656,13 +801,14 @@ main_menu() {
 
 # ----------------------------------------------------------------------------
 main() {
-  TMP=$(mktemp -d /tmp/mineflarex.XXXXXX) || { echo "mktemp failed"; exit 1; }
   trap cleanup EXIT
   trap 'exit 130' INT TERM
   trap 'RESIZED=1' WINCH
   setup_locale
   setup_theme
   update_dims
+  enter_fullscreen          # theme colors + black full screen from the very first moment
+  TMP=$(mktemp -d /tmp/mineflarex.XXXXXX) || { leave_fullscreen; echo "mktemp failed"; exit 1; }
   build_logo
   detect_pm || true
   boot
