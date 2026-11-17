@@ -38,7 +38,7 @@ BOOT_SOFT=0
 BOOT_TOTAL=5
 BOOT_DONE=0
 SPL_BAR=0; SPL_STAT=0; SPL_CHK=0; SPL_N=0; SPL_PCT=0
-CUR_KEY=""; CUR_TITLE=""; CUR_FN=""; CUR_INFO=()
+CUR_KEY=""; CUR_TITLE=""; CUR_FN=""; CUR_UPD=""; CUR_INFO=()
 
 # ----------------------------------------------------------------------------
 #  Core helpers: logging, locale, theme, screen
@@ -676,6 +676,7 @@ draw_module_menu() {
   box_sep
   box_kv "[1]" "Start Install"  "Begin installation"
   box_kv "[2]" "View Log"       "Show recent log lines"
+  [ -n "$CUR_UPD" ] && box_kv "[3]" "Update"     "Update to the latest version (data is kept)"
   box_kv "[B]" "Back"           "Back to Main Menu"
   box_kv "[0]" "Exit"           ""
   box_bot
@@ -727,8 +728,26 @@ do_exit() {
   exit 0
 }
 
-module_menu() {  # key title install_fn   (CUR_INFO set by caller)
-  CUR_KEY=$1; CUR_TITLE=$2; CUR_FN=$3; MSG=""
+run_update() {
+  REDRAW=""
+  header_small "$CUR_TITLE - UPDATE"
+  box_row "Log: $LOG_FILE" "$DIM"
+  box_bot
+  log "=== BEGIN $CUR_KEY update ==="
+  "$CUR_UPD"; local rc=$?
+  log "=== END $CUR_KEY update rc=$rc ==="
+  printf '\n'
+  case $rc in
+    0) box_top; box_center "UPDATE COMPLETE" "$GRN$BLD"; box_center "$CUR_TITLE is up to date. Your data was kept." "$WHT"
+       box_row "Log: $LOG_FILE" "$DIM"; box_bot ;;
+    2) printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST" ;;
+    *) printf '  %s%sUPDATE FAILED%s - see details above. Your data is untouched.\n  Log: %s\n' "$RED" "$BLD" "$RST" "$LOG_FILE" ;;
+  esac
+  press_any_key
+}
+
+module_menu() {  # key title install_fn [update_fn]  (CUR_INFO set by caller)
+  CUR_KEY=$1; CUR_TITLE=$2; CUR_FN=$3; CUR_UPD=${4:-}; MSG=""
   while true; do
     REDRAW=draw_module_menu
     draw_module_menu
@@ -737,11 +756,12 @@ module_menu() {  # key title install_fn   (CUR_INFO set by caller)
     case $KEY in
       1) confirm_install && run_install ;;
       2) view_log ;;
+      3) if [ -n "$CUR_UPD" ]; then run_update; else MSG="Invalid option '3'. Use 1, 2, B or 0."; fi ;;
       b|B) return 0 ;;
       0|q|Q) do_exit ;;
-      $'\e') drain_esc; MSG="Invalid input. Use 1, 2, B or 0." ;;
-      "") MSG="Please press 1, 2, B or 0." ;;
-      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Use 1, 2, B or 0." ;;
+      $'\e') drain_esc; MSG="Invalid input. Use the numbers shown, B or 0." ;;
+      "") MSG="Please press a number shown, B or 0." ;;
+      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Use the numbers shown, B or 0." ;;
     esac
   done
 }
@@ -802,6 +822,7 @@ panel_fetch_zip() {  # download minepanel.zip -> $PANEL_DIR (HTTPS only; keeps n
     src=$(find "$src" -mindepth 1 -maxdepth 1 -type d | head -n1)
   fi
   [ -f "$src/server.js" ] || { rm -rf "$tmp"; echo "server.js not found in the zip"; return 1; }
+  rm -rf "$PANEL_DIR"   # staging copy only: the live panel lives in $PANEL_HOME and is untouched here
   mkdir -p "$PANEL_DIR" && cp -a "$src"/. "$PANEL_DIR"/ || { rm -rf "$tmp"; echo "copy failed"; return 1; }
   rm -rf "$tmp"
   echo "zip ok, $(find "$PANEL_DIR" -type f | wc -l) files"
@@ -904,6 +925,68 @@ panel_open_hint() {
   printf '  %sLogs: journalctl -u minepanel -f%s\n' "$DIM" "$RST"
 }
 
+# ---- Update: new code from the zip; database, .env, servers and bots (data/) are never touched --------
+panel_stop() {
+  systemctl stop minepanel >>"$LOG_FILE" 2>&1 || { echo "could not stop the panel service"; return 1; }
+  echo "panel stopped (running servers stop with it and come back when it starts)"
+}
+
+panel_snapshot() {   # whole data/ + .env + current code -> update-backups/<time>/   (made while the panel is stopped)
+  local b="$PANEL_HOME/update-backups/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$b" "$STATE_DIR" || return 1
+  ( cd "$PANEL_HOME" && tar --exclude=./update-backups --exclude=./data/servers -cf "$b/state.tar" . ) \
+    || { echo "backup failed - nothing was changed"; return 1; }
+  chmod 600 "$b/state.tar"
+  PANEL_LAST_BACKUP="$b"; printf '%s\n' "$b" >"$STATE_DIR/panel-last-backup" 2>/dev/null
+  # keep only the 5 newest backups
+  ls -1dt "$PANEL_HOME"/update-backups/*/ 2>/dev/null | tail -n +6 | xargs -r rm -rf
+  echo "backup: $b"
+}
+
+panel_stop_backup() { panel_stop && panel_snapshot; }
+
+panel_update_files() {  # replace code only; .env and data/ stay exactly as they are
+  local d
+  for d in src public scripts deploy tests; do rm -rf "${PANEL_HOME:?}/$d"; done
+  ( cd "$PANEL_DIR" && tar --exclude=.git --exclude=node_modules --exclude=./.env --exclude=./data -cf - . ) \
+    | ( cd "$PANEL_HOME" && tar -xf - ) || { echo "copy failed"; return 1; }
+  chown -R minepanel:minepanel "$PANEL_HOME" 2>/dev/null
+  echo "new code in place; data and .env kept"
+}
+
+panel_rollback() {  # put the code from the pre-update backup back (data/ was never changed, so it is left as is)
+  local b; b=$(cat "$STATE_DIR/panel-last-backup" 2>/dev/null)
+  [ -f "$b/state.tar" ] || return 1
+  local d; for d in src public scripts deploy tests; do rm -rf "${PANEL_HOME:?}/$d"; done
+  ( cd "$PANEL_HOME" && tar -xf "$b/state.tar" --exclude=./.env --exclude=./data ) || return 1
+  chown -R minepanel:minepanel "$PANEL_HOME" 2>/dev/null
+  systemctl restart minepanel >>"$LOG_FILE" 2>&1
+}
+
+update_mine_panel() {
+  STAGE_TOTAL=6; STAGE_DONE=0
+  if ! panel_installed; then
+    printf '  %s%s%s Mine Panel is not installed yet. Use [1] Start Install first.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sYour database, users, servers, bots, files and .env are kept.%s\n' "$DIM" "$RST"
+  printf '  %sThe panel restarts for a few seconds (running servers restart with it).%s\n\n' "$DIM" "$RST"
+  ask_yn "Update Mine Panel now?" || return 2
+  printf '\n'
+  stage "Preflight: disk & network" preflight "$PANEL_ZIP_URL" || return 1
+  stage "Downloading new version (zip)" panel_fetch_zip || return 1          # live panel is still untouched here
+  stage "Installing Node.js, Python, Java (if missing)" panel_deps || return 1
+  stage "Stopping panel + backup (database, .env)" panel_stop_backup || { systemctl start minepanel >/dev/null 2>&1; return 1; }
+  stage "Installing new code" panel_update_files || { panel_rollback; return 1; }
+  if ! stage "Starting panel service" panel_service; then
+    printf '  %s%s%s New version did not start - restoring the previous code...\n' "$YEL" "$WRN" "$RST"
+    panel_rollback && printf '  %s%s%s Previous version restored. Your data was never changed.\n' "$GRN" "$OK" "$RST"
+    return 1
+  fi
+  mark_installed mine-panel
+  panel_open_hint
+  return 0
+}
+
 install_mine_panel() {
   local update=0
   panel_installed && update=1
@@ -936,8 +1019,9 @@ module_mine_panel() {
   CUR_INFO=("Mine Panel (Minecraft + Bot hosting)"
             "Source : $PANEL_ZIP_URL"
             "Steps  : download zip, install Node/Python/Java, start panel"
-            "Last   : asks the admin email + password")
-  module_menu mine-panel "MINE PANEL" install_mine_panel
+            "Last   : asks the admin email + password"
+            "Update : menu [3] keeps all your data")
+  module_menu mine-panel "MINE PANEL" install_mine_panel update_mine_panel
 }
 
 # ----------------------------------------------------------------------------
