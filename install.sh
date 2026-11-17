@@ -8,7 +8,11 @@ set -uo pipefail
 MFX_VERSION="1.0.0"
 BASE_URL="${MFX_BASE_URL:-https://mineflarex.indevs.in}"
 BOT_REPO="${MFX_BOT_REPO:-https://github.com/mineflarex-collab/Bvm-v1bot.git}"
+PANEL_ZIP_URL="${MFX_PANEL_ZIP:-$BASE_URL/minepanel.zip}"   # panel is installed from this single zip (no GitHub folders needed)
+PANEL_REPO="${MFX_PANEL_REPO:-https://github.com/mineflarex-collab/mineflarex-panel.git}"   # <- your minePanel repo (project root = install.sh + server.js)
+PANEL_HOME="${MFX_PANEL_HOME:-/opt/minepanel}"
 INSTALL_ROOT="/opt/mineflarex"
+PANEL_DIR="$INSTALL_ROOT/mineflarex-panel"
 BOT_DIR="$INSTALL_ROOT/Bvm-v1bot"
 STATE_DIR="/var/lib/mineflarex"
 LOG_DIR="/var/log/mineflarex"
@@ -769,21 +773,171 @@ module_bvm_bot() {
 }
 
 # ============================================================================
-#  OPTION 2: UPCOMING (placeholder - panel not released yet)
+#  MODULE 2: MINE PANEL  (everything happens in THIS installer: clone -> install -> admin email + password)
 # ============================================================================
-draw_upcoming() {
-  header_small "UPCOMING"
-  box_center "COMING SOON" "$P$BLD"
-  box_blank
-  box_row "This panel has not been released yet." "$WHT"
-  box_row "Stay tuned for updates from MineFlareX." "$DIM"
-  box_bot
-  printf '\n%*s%sPress any key to go back...%s' "$PAD" '' "$DIM" "$RST"
+PANEL_NODE_FLAGS="--disable-warning=ExperimentalWarning"
+PANEL_PORT=3000
+panel_installed() { [ -f /etc/systemd/system/minepanel.service ] && [ -d "$PANEL_HOME" ]; }
+panel_admin_exists() { [ -f "$PANEL_HOME/data/.admin-created" ]; }
+
+panel_check_os() {
+  [ "$PM" = apt ] || { echo "Mine Panel supports Ubuntu / Debian (apt) only."; return 1; }
+  echo "apt (Ubuntu / Debian)"
 }
-module_upcoming() {
-  REDRAW=draw_upcoming
-  draw_upcoming
-  read_key || exit 0
+
+panel_fetch_zip() {  # download minepanel.zip -> $PANEL_DIR (HTTPS only; keeps nothing but the files)
+  [[ $PANEL_ZIP_URL == https://* ]] || { echo "Refusing non-HTTPS zip URL: $PANEL_ZIP_URL"; return 1; }
+  command -v unzip >/dev/null 2>&1 || { apt-get update -y >>"$LOG_FILE" 2>&1; apt-get install -y unzip >>"$LOG_FILE" 2>&1; }
+  command -v unzip >/dev/null 2>&1 || { echo "unzip could not be installed (see log)"; return 1; }
+  local tmp z src
+  tmp=$(mktemp -d) || return 1
+  z="$tmp/panel.zip"
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 180 -o "$z" "$PANEL_ZIP_URL" \
+    || { rm -rf "$tmp"; echo "Cannot download $PANEL_ZIP_URL"; return 1; }
+  unzip -tq "$z" >/dev/null 2>&1 || { rm -rf "$tmp"; echo "Downloaded file is not a valid zip (wrong link?)"; return 1; }
+  unzip -q "$z" -d "$tmp/x" || { rm -rf "$tmp"; echo "unzip failed"; return 1; }
+  src="$tmp/x"
+  # zip may contain one top folder (e.g. minepanel-auth/): use it as the root
+  if [ ! -f "$src/server.js" ] && [ "$(find "$src" -mindepth 1 -maxdepth 1 | wc -l)" = 1 ]; then
+    src=$(find "$src" -mindepth 1 -maxdepth 1 -type d | head -n1)
+  fi
+  [ -f "$src/server.js" ] || { rm -rf "$tmp"; echo "server.js not found in the zip"; return 1; }
+  mkdir -p "$PANEL_DIR" && cp -a "$src"/. "$PANEL_DIR"/ || { rm -rf "$tmp"; echo "copy failed"; return 1; }
+  rm -rf "$tmp"
+  echo "zip ok, $(find "$PANEL_DIR" -type f | wc -l) files"
+}
+
+panel_check_src() {
+  [ -f "$PANEL_DIR/server.js" ] && [ -f "$PANEL_DIR/package.json" ] \
+    || { echo "server.js not found in the root of $PANEL_REPO - put the panel files in the zip root"; return 1; }
+  echo "panel files found"
+}
+
+panel_deps() {   # Node.js 22 + Python 3 (Python bots) + Java (Minecraft)
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >>"$LOG_FILE" 2>&1 || { echo "apt update failed (see log)"; return 1; }
+  apt-get install -y curl ca-certificates gnupg openssl python3 python3-pip python3-venv >>"$LOG_FILE" 2>&1 \
+    || { echo "could not install base packages (see log)"; return 1; }
+  apt-get install -y openjdk-21-jre-headless >>"$LOG_FILE" 2>&1 \
+    || apt-get install -y openjdk-17-jre-headless >>"$LOG_FILE" 2>&1 \
+    || log "Java could not be installed automatically"
+  local ok=0
+  if command -v node >/dev/null 2>&1; then
+    node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a===22&&b>=13)?0:1)' && ok=1
+  fi
+  if [ "$ok" = 0 ]; then
+    curl -fsSL https://deb.nodesource.com/setup_22.x 2>>"$LOG_FILE" | bash - >>"$LOG_FILE" 2>&1 || { echo "Node.js repository setup failed (see log)"; return 1; }
+    apt-get install -y nodejs >>"$LOG_FILE" 2>&1 || { echo "Node.js install failed (see log)"; return 1; }
+  fi
+  echo "node $(node -v), $(python3 --version 2>&1 | awk '{print $2}')"
+}
+
+panel_files() {  # copy the panel to /opt/minepanel; the live .env and data/ (database, servers, bots) are never touched
+  id minepanel >/dev/null 2>&1 || useradd --system --create-home --home-dir "$PANEL_HOME" --shell /usr/sbin/nologin minepanel || return 1
+  mkdir -p "$PANEL_HOME" || return 1
+  ( cd "$PANEL_DIR" && tar --exclude=.git --exclude=node_modules --exclude=./.env --exclude=./data -cf - . ) \
+    | ( cd "$PANEL_HOME" && tar -xf - ) || { echo "copy failed"; return 1; }
+  mkdir -p "$PANEL_HOME/data/servers"
+  if [ ! -f "$PANEL_HOME/.env" ]; then
+    cp "$PANEL_HOME/deploy/env.production.example" "$PANEL_HOME/.env" || return 1
+    # Works on any address Cloudflare gives it. BASE_URL is only used for password-reset links.
+    sed -i "s|https://panel.example.com|http://localhost:$PANEL_PORT|; s|__GENERATED__|$(openssl rand -hex 32)|" "$PANEL_HOME/.env"
+    chmod 600 "$PANEL_HOME/.env"
+  fi
+  chown -R minepanel:minepanel "$PANEL_HOME"
+  echo "installed in $PANEL_HOME"
+}
+
+panel_backup() {
+  local b="$PANEL_HOME/update-backups/$(date +%Y%m%d-%H%M%S)" f
+  mkdir -p "$b" || return 1
+  for f in "$PANEL_HOME"/data/minepanel.db "$PANEL_HOME"/data/minepanel.db-wal "$PANEL_HOME"/data/minepanel.db-shm; do [ -f "$f" ] && cp -a "$f" "$b/"; done
+  echo "backup: $b"
+}
+
+panel_service() {
+  cp "$PANEL_HOME/deploy/minepanel.service" /etc/systemd/system/minepanel.service || return 1
+  systemctl daemon-reload
+  systemctl enable minepanel >/dev/null 2>&1
+  systemctl restart minepanel || { echo "systemctl restart failed"; return 1; }
+  local i
+  for i in $(seq 1 25); do
+    curl -fsS "http://127.0.0.1:$PANEL_PORT/healthz" >/dev/null 2>&1 && { echo "panel running on 127.0.0.1:$PANEL_PORT"; return 0; }
+    sleep 1
+  done
+  echo "panel did not start - see: journalctl -u minepanel -n 50 --no-pager"; return 1
+}
+
+# Last step: asks for the admin email + password on the terminal and creates the account.
+panel_admin() {
+  [ -r /dev/tty ] || { echo "no terminal available"; return 1; }
+  local email pw pw2 user out try
+  printf '  %s%sCreate your admin account%s\n  %s(you will sign in to the panel with this email and password)%s\n\n' "$P" "$BLD" "$RST" "$DIM" "$RST"
+  while true; do
+    printf '  %sAdmin email (gmail):%s ' "$WHT" "$RST" >/dev/tty;                       IFS= read -r email </dev/tty
+    email=$(printf '%s' "$email" | tr -d '[:space:]')
+    [ -n "$email" ] || { printf '  %sEmail is required.%s\n' "$YEL" "$RST"; continue; }
+    printf '  %sPassword (10+ characters, letters + numbers):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -rs pw </dev/tty;  printf '\n' >/dev/tty
+    printf '  %sPassword again:%s ' "$WHT" "$RST" >/dev/tty;                            IFS= read -rs pw2 </dev/tty; printf '\n' >/dev/tty
+    [ "$pw" = "$pw2" ] || { printf '  %sThe two passwords do not match. Try again.%s\n\n' "$YEL" "$RST"; continue; }
+    user=$(printf '%s' "${email%%@*}" | tr -c 'A-Za-z0-9_-' '_'); user=${user:0:20}
+    [ "${#user}" -ge 3 ] || user="admin"
+    for try in 1 2 3; do
+      if out=$( cd "$PANEL_HOME" && runuser -u minepanel -- env ADMIN_PASSWORD="$pw" node $PANEL_NODE_FLAGS scripts/create-admin.js "$email" "$user" 2>&1 ); then
+        : > "$PANEL_HOME/data/.admin-created"; chown minepanel:minepanel "$PANEL_HOME/data/.admin-created" 2>/dev/null
+        printf '  %s%s%s Admin account ready: %s\n' "$GRN" "$OK" "$RST" "$email"
+        return 0
+      fi
+      if printf '%s' "$out" | grep -qi 'taken'; then user="${user:0:15}$((RANDOM % 9000 + 1000))"; continue; fi   # username used: add digits
+      break
+    done
+    printf '  %s%s%s\n\n' "$YEL" "$(printf '%s' "$out" | tail -n1)" "$RST"
+  done
+}
+
+panel_open_hint() {
+  printf '\n  %s%sOpen the panel through Cloudflare%s\n' "$P" "$BLD" "$RST"
+  printf '  %sThe panel runs on http://localhost:%s . In your Cloudflare tunnel add a public hostname:%s\n' "$DIM" "$PANEL_PORT" "$RST"
+  printf '  %sService HTTP -> localhost:%s  (Zero Trust > Networks > Tunnels). No domain? Free temporary link:%s\n' "$DIM" "$PANEL_PORT" "$RST"
+  printf '    %scloudflared tunnel --url http://localhost:%s%s\n' "$WHT" "$PANEL_PORT" "$RST"
+  printf '  %sMinecraft players connect to VPS-IP:25565  (ufw allow 25565/tcp)%s\n' "$DIM" "$RST"
+  printf '  %sLogs: journalctl -u minepanel -f%s\n' "$DIM" "$RST"
+}
+
+install_mine_panel() {
+  local update=0
+  panel_installed && update=1
+  STAGE_TOTAL=8; STAGE_DONE=0
+  if [ -e "$PANEL_DIR" ] || (( update )); then
+    printf '  %s%s%s Mine Panel is already installed - this will UPDATE it.\n' "$YEL" "$WRN" "$RST"
+    ask_yn "Update now? Your data, servers and admin login are kept." || return 2
+  fi
+  printf '\n'
+  stage "Preflight: disk & network" preflight "$PANEL_ZIP_URL" || return 1
+  stage "Checking system (Ubuntu / Debian)" panel_check_os || return 1
+  stage "Downloading Mine Panel (zip)" panel_fetch_zip || return 1
+  stage "Checking panel files" panel_check_src || return 1
+  stage "Installing Node.js, Python, Java" panel_deps || return 1
+  (( update )) && { stage "Backing up database" panel_backup || return 1; }
+  stage "Installing panel files" panel_files || return 1
+  stage "Starting panel service" panel_service || return 1
+  if panel_admin_exists; then
+    printf '  %s%s%s %-34s %skept (already exists)%s\n' "$GRN" "$OK" "$RST" "Admin account" "$DIM" "$RST"
+  else
+    STAGE_TOTAL=$(( STAGE_TOTAL + 1 ))
+    stage_fg "Admin account (email + password)" panel_admin || return 1
+  fi
+  mark_installed mine-panel
+  panel_open_hint
+  return 0
+}
+
+module_mine_panel() {
+  CUR_INFO=("Mine Panel (Minecraft + Bot hosting)"
+            "Source : $PANEL_ZIP_URL"
+            "Steps  : download zip, install Node/Python/Java, start panel"
+            "Last   : asks the admin email + password")
+  module_menu mine-panel "MINE PANEL" install_mine_panel
 }
 
 # ----------------------------------------------------------------------------
@@ -851,7 +1005,7 @@ draw_main_menu() {
   box_center "SELECT AN INSTALLATION" "$WHT$BLD"
   box_blank
   box_kv "[1]" "BVM VPS BOT"   "VPS automation bot"
-  box_kv "[2]" "UPCOMING"      "Coming soon - not released"
+  box_kv "[2]" "MINE PANEL"    "Minecraft + Bot hosting panel"
   box_blank
   box_kv "[0]" "EXIT" ""
   box_blank
@@ -871,7 +1025,7 @@ main_menu() {
     MSG=""
     case $KEY in
       1) module_bvm_bot ;;
-      2) module_upcoming ;;
+      2) module_mine_panel ;;
       0|q|Q) do_exit ;;
       t|T) cycle_theme ;;
       u|U) toggle_unicode ;;
