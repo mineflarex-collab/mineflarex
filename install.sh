@@ -784,12 +784,30 @@ install_bvm_bot() {
   mark_installed bvm-bot
   return 0
 }
+update_bvm_bot() {
+  STAGE_TOTAL=5; STAGE_DONE=0
+  if [ ! -d "$BOT_DIR/.git" ]; then
+    printf '  %s%s%s BVM VPS BOT is not installed yet. Use [1] Start Install first.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sThe latest code is pulled (git pull); your bot data and config files are kept.%s\n' "$DIM" "$RST"
+  printf '  %sIts install.sh runs again to apply the update.%s\n\n' "$DIM" "$RST"
+  ask_yn "Update BVM VPS BOT now?" || return 2
+  printf '\n'
+  stage "Preflight: disk & network" preflight "https://github.com" || return 1
+  stage "Checking git" ensure_git || return 1
+  stage "Pulling latest Bvm-v1bot code" git_fetch_repo "$BOT_REPO" "$BOT_DIR" || return 1
+  stage "Validating install.sh" validate_script "$BOT_DIR/install.sh" || return 1
+  stage_fg "Running install.sh (apply update)" run_bot_installer || return 1
+  mark_installed bvm-bot
+  return 0
+}
 module_bvm_bot() {
   CUR_INFO=("BVM VPS bot (Discord)"
             "Repo   : github.com/mineflarex-collab/Bvm-v1bot"
             "Steps  : git clone, validate, run install.sh"
+            "Update : [3] pulls the latest code and re-applies it"
             "Needs  : root, git (auto-installed), internet")
-  module_menu bvm-bot "BVM VPS BOT" install_bvm_bot
+  module_menu bvm-bot "BVM VPS BOT" install_bvm_bot update_bvm_bot
 }
 
 # ============================================================================
