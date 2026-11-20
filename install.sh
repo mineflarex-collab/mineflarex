@@ -1042,6 +1042,205 @@ module_mine_panel() {
   module_menu mine-panel "MINE PANEL" install_mine_panel update_mine_panel
 }
 
+# ============================================================================
+#  MODULE 3: CLOUDFLARE TUNNEL  (install cloudflared + connect with token / uninstall)
+# ============================================================================
+CF_TOKEN=""
+cf_installed()      { command -v cloudflared >/dev/null 2>&1; }
+cf_service_exists() { [ -f /etc/systemd/system/cloudflared.service ]; }
+
+cf_status() {
+  if cf_service_exists; then
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then echo "installed - tunnel running"
+    else echo "installed - tunnel NOT running"; fi
+  elif cf_installed; then echo "cloudflared installed - no tunnel connected"
+  else echo "not installed"; fi
+}
+
+cf_install_pkg() {   # official Cloudflare package repo (apt / dnf / yum)
+  export DEBIAN_FRONTEND=noninteractive
+  case $PM in
+    apt)
+      mkdir -p --mode=0755 /usr/share/keyrings || return 1
+      curl --proto '=https' --tlsv1.2 -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+        -o /usr/share/keyrings/cloudflare-main.gpg || { echo "cannot download the Cloudflare key"; return 1; }
+      printf 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main\n' \
+        >/etc/apt/sources.list.d/cloudflared.list || return 1
+      apt-get update -y >>"$LOG_FILE" 2>&1 || { echo "apt update failed (see log)"; return 1; }
+      apt-get install -y cloudflared >>"$LOG_FILE" 2>&1 || { echo "cloudflared install failed (see log)"; return 1; }
+      ;;
+    dnf|yum)
+      curl --proto '=https' --tlsv1.2 -fsSL https://pkg.cloudflare.com/cloudflared.repo \
+        -o /etc/yum.repos.d/cloudflared.repo || { echo "cannot download the Cloudflare repo file"; return 1; }
+      "$PM" install -y cloudflared >>"$LOG_FILE" 2>&1 || { echo "cloudflared install failed (see log)"; return 1; }
+      ;;
+  esac
+  cf_installed || { echo "cloudflared still missing after install"; return 1; }
+  echo "cloudflared $(cloudflared --version 2>/dev/null | awk '{print $3}')"
+}
+
+# Asks for the tunnel token. You can paste ONLY the token, or the whole command
+# Cloudflare shows you (sudo cloudflared service install <token>) - the token is picked out.
+cf_ask_token() {
+  [ -r /dev/tty ] || { echo "no terminal available"; return 1; }
+  local raw tok
+  printf '  %s%sPaste your Cloudflare Tunnel token%s\n' "$P" "$BLD" "$RST"
+  printf '  %s(Zero Trust > Networks > Tunnels > your tunnel > Install connector)%s\n' "$DIM" "$RST"
+  printf '  %s(token OR the full "sudo cloudflared service install ..." command - input is hidden; empty = cancel)%s\n\n' "$DIM" "$RST"
+  while true; do
+    printf '  %sToken:%s ' "$WHT" "$RST" >/dev/tty
+    IFS= read -rs raw </dev/tty; printf '\n' >/dev/tty
+    tok=$(printf '%s' "$raw" | awk '{print $NF}')
+    [ -n "$tok" ] || { printf '  %sNo token entered - cancelled.%s\n' "$YEL" "$RST"; return 1; }
+    if [[ $tok =~ ^[A-Za-z0-9_=+/-]{40,}$ ]]; then
+      CF_TOKEN=$tok
+      printf '  %s%s%s Token received (%s characters)\n' "$GRN" "$OK" "$RST" "${#tok}"
+      return 0
+    fi
+    printf '  %sThat does not look like a Cloudflare tunnel token. Copy it again and retry.%s\n\n' "$YEL" "$RST"
+  done
+}
+
+cf_service_install() {
+  [ -n "${CF_TOKEN:-}" ] || { echo "no token provided"; return 1; }
+  local out
+  if cf_service_exists; then cloudflared service uninstall >>"$LOG_FILE" 2>&1 || true; fi
+  if ! out=$(cloudflared service install "$CF_TOKEN" 2>&1); then
+    out=${out//"$CF_TOKEN"/***}                      # never show / log the token
+    log "cloudflared service install failed: ${out##*$'\n'}"
+    echo "service install failed: ${out##*$'\n'}"; return 1
+  fi
+  echo "cloudflared service installed"
+}
+
+cf_verify() {
+  local i
+  for i in $(seq 1 20); do
+    systemctl is-active --quiet cloudflared 2>/dev/null && { echo "cloudflared service is running"; return 0; }
+    sleep 1
+  done
+  echo "service not running - see: journalctl -u cloudflared -n 50 --no-pager"; return 1
+}
+
+cf_open_hint() {
+  printf '\n  %s%sFinish in the Cloudflare dashboard%s\n' "$P" "$BLD" "$RST"
+  printf '  %sZero Trust > Networks > Tunnels > your tunnel > Public Hostname > Add:%s\n' "$DIM" "$RST"
+  printf '  %sService HTTP -> localhost:%s   (this is the Mine Panel port)%s\n' "$DIM" "$PANEL_PORT" "$RST"
+  printf '  %sLogs: journalctl -u cloudflared -f%s\n' "$DIM" "$RST"
+}
+
+install_cloudflare() {
+  STAGE_TOTAL=5; STAGE_DONE=0; CF_TOKEN=""
+  if cf_service_exists; then
+    printf '  %s%s%s A Cloudflare tunnel service already exists on this VPS.\n' "$YEL" "$WRN" "$RST"
+    ask_yn "Replace it with a new token?" || return 2
+  fi
+  printf '\n'
+  stage    "Preflight: disk & network"  preflight "https://pkg.cloudflare.com/cloudflare-main.gpg" || return 1
+  stage    "Installing cloudflared"     cf_install_pkg || return 1
+  stage_fg "Tunnel token"               cf_ask_token   || { CF_TOKEN=""; return 1; }
+  stage    "Connecting tunnel (service)" cf_service_install || { CF_TOKEN=""; return 1; }
+  CF_TOKEN=""
+  stage    "Verifying tunnel"           cf_verify || return 1
+  mark_installed cloudflare
+  cf_open_hint
+  return 0
+}
+
+cf_service_remove() {
+  if cf_service_exists; then
+    if cf_installed; then cloudflared service uninstall >>"$LOG_FILE" 2>&1 || true; fi
+    systemctl stop cloudflared >>"$LOG_FILE" 2>&1 || true
+    systemctl disable cloudflared >>"$LOG_FILE" 2>&1 || true
+    rm -f /etc/systemd/system/cloudflared.service /etc/systemd/system/cloudflared-update.service /etc/systemd/system/cloudflared-update.timer
+    systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+    echo "tunnel service removed"
+  else
+    echo "no tunnel service found"
+  fi
+}
+
+cf_pkg_remove() {
+  export DEBIAN_FRONTEND=noninteractive
+  case $PM in
+    apt)     apt-get remove -y cloudflared >>"$LOG_FILE" 2>&1 || { echo "package removal failed (see log)"; return 1; } ;;
+    dnf|yum) "$PM" remove -y cloudflared >>"$LOG_FILE" 2>&1   || { echo "package removal failed (see log)"; return 1; } ;;
+  esac
+  rm -f /usr/local/bin/cloudflared   # manual installs
+  echo "cloudflared removed"
+}
+
+cf_clean() {
+  rm -f /etc/apt/sources.list.d/cloudflared.list /usr/share/keyrings/cloudflare-main.gpg /etc/yum.repos.d/cloudflared.repo
+  rm -rf /etc/cloudflared
+  rm -f "$STATE_DIR/cloudflare.installed"
+  echo "repo, key and /etc/cloudflared cleaned"
+}
+
+uninstall_cloudflare() {
+  STAGE_TOTAL=3; STAGE_DONE=0
+  if ! cf_installed && ! cf_service_exists; then
+    printf '  %s%s%s Cloudflare is not installed - nothing to remove.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sThis stops the tunnel and removes cloudflared, its service and /etc/cloudflared.%s\n' "$DIM" "$RST"
+  printf '  %sYour sites/panel stay on the VPS but will no longer be reachable through the tunnel.%s\n' "$DIM" "$RST"
+  ask_yn "Uninstall Cloudflare now?" || return 2
+  printf '\n'
+  stage "Removing tunnel service"     cf_service_remove || return 1
+  stage "Removing cloudflared"        cf_pkg_remove     || return 1
+  stage "Cleaning repo and config"    cf_clean          || return 1
+  return 0
+}
+
+run_cf_action() {  # title fn success_message
+  REDRAW=""
+  header_small "$1"
+  box_row "Log: $LOG_FILE" "$DIM"
+  box_bot
+  log "=== BEGIN $1 ==="
+  "$2"; local rc=$?
+  log "=== END $1 rc=$rc ==="
+  printf '\n'
+  case $rc in
+    0) box_top; box_center "$3" "$GRN$BLD"; box_row "Log: $LOG_FILE" "$DIM"; box_bot ;;
+    2) printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST" ;;
+    *) printf '  %s%sFAILED%s - see details above.\n  Log: %s\n' "$RED" "$BLD" "$RST" "$LOG_FILE" ;;
+  esac
+  press_any_key
+}
+
+draw_cf_menu() {
+  header_small "CLOUDFLARE TUNNEL"
+  box_row "Status : $(cf_status)" "$DIM"
+  box_row "Needs  : root, internet, Cloudflare tunnel token" "$DIM"
+  box_sep
+  box_kv "[1]" "Install"   "Install cloudflared + connect with token"
+  box_kv "[2]" "Uninstall" "Remove cloudflared and the tunnel"
+  box_kv "[B]" "Back"      "Back to Main Menu"
+  box_bot
+  [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
+  printf '\n%*s%sSelect option:%s ' "$PAD" '' "$P$BLD" "$RST"
+}
+
+module_cloudflare() {
+  MSG=""
+  while true; do
+    REDRAW=draw_cf_menu
+    draw_cf_menu
+    read_key || exit 0
+    MSG=""
+    case $KEY in
+      1) run_cf_action "CLOUDFLARE - INSTALL"   install_cloudflare   "CLOUDFLARE INSTALLED & CONNECTED" ;;
+      2) run_cf_action "CLOUDFLARE - UNINSTALL" uninstall_cloudflare "CLOUDFLARE UNINSTALLED" ;;
+      b|B) return 0 ;;
+      0|q|Q) do_exit ;;
+      $'\e') drain_esc; MSG="Invalid input. Use 1, 2 or B." ;;
+      "") MSG="Please press 1, 2 or B." ;;
+      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Use 1, 2 or B." ;;
+    esac
+  done
+}
+
 # ----------------------------------------------------------------------------
 #  Welcome + main menu
 # ----------------------------------------------------------------------------
@@ -1108,13 +1307,14 @@ draw_main_menu() {
   box_blank
   box_kv "[1]" "BVM VPS BOT"   "VPS automation bot"
   box_kv "[2]" "MINE PANEL"    "Minecraft + Bot hosting panel"
+  box_kv "[3]" "CLOUDFLARE"    "Cloudflare tunnel (install / uninstall)"
   box_blank
   box_kv "[0]" "EXIT" ""
   box_blank
   box_row "T = colors (now: $THEME_MODE)   U = Unicode/ASCII symbols" "$DIM"
   box_bot
   [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
-  printf '\n%*s%sEnter choice [1-2, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
+  printf '\n%*s%sEnter choice [1-3, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
 }
 
 main_menu() {
@@ -1128,12 +1328,13 @@ main_menu() {
     case $KEY in
       1) module_bvm_bot ;;
       2) module_mine_panel ;;
+      3) module_cloudflare ;;
       0|q|Q) do_exit ;;
       t|T) cycle_theme ;;
       u|U) toggle_unicode ;;
-      $'\e') drain_esc; MSG="Invalid input. Please press 1, 2 or 0." ;;
-      "") MSG="Please press 1, 2 or 0." ;;
-      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Please press 1, 2 or 0." ;;
+      $'\e') drain_esc; MSG="Invalid input. Please press 1, 2, 3 or 0." ;;
+      "") MSG="Please press 1, 2, 3 or 0." ;;
+      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Please press 1, 2, 3 or 0." ;;
     esac
   done
 }
