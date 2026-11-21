@@ -1338,7 +1338,16 @@ main() {
   setup_theme
   update_dims
   enter_fullscreen          # theme colors + black full screen from the very first moment
-  TMP=$(mktemp -d /tmp/mineflarex.XXXXXX) || { leave_fullscreen; echo "mktemp failed"; exit 1; }
+  # Pick a writable temp dir: $TMPDIR, /tmp, /var/tmp, $PREFIX/tmp (Termux), $HOME - first one that works
+  TMP=""
+  for _d in "${TMPDIR:-}" /tmp /var/tmp "${PREFIX:-}/tmp" "$HOME"; do
+    [ -n "$_d" ] || continue
+    [ -d "$_d" ] || mkdir -p "$_d" 2>/dev/null || continue
+    [ -w "$_d" ] || continue
+    TMP=$(mktemp -d "$_d/mineflarex.XXXXXX" 2>/dev/null) && break
+    TMP=""
+  done
+  [ -n "$TMP" ] || { leave_fullscreen; echo "mktemp failed: no writable temp directory (tried TMPDIR, /tmp, /var/tmp, HOME)"; exit 1; }
   build_logo
   detect_pm || true
   boot
