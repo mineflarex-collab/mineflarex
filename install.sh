@@ -945,9 +945,13 @@ panel_admin() {
     printf '  %sAdmin email (gmail):%s ' "$WHT" "$RST" >/dev/tty;                       IFS= read -r email </dev/tty
     email=$(printf '%s' "$email" | tr -d '[:space:]')
     [ -n "$email" ] || { printf '  %sEmail is required.%s\n' "$YEL" "$RST"; continue; }
+    [[ $email =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || { printf '  %sThat does not look like a valid email address.%s\n' "$YEL" "$RST"; continue; }
     printf '  %sPassword (10+ characters, letters + numbers):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -rs pw </dev/tty;  printf '\n' >/dev/tty
     printf '  %sPassword again:%s ' "$WHT" "$RST" >/dev/tty;                            IFS= read -rs pw2 </dev/tty; printf '\n' >/dev/tty
     [ "$pw" = "$pw2" ] || { printf '  %sThe two passwords do not match. Try again.%s\n\n' "$YEL" "$RST"; continue; }
+    if (( ${#pw} < 10 )) || [[ ! $pw =~ [A-Za-z] ]] || [[ ! $pw =~ [0-9] ]]; then
+      printf '  %sPassword must be 10+ characters and contain both letters and numbers. Try again.%s\n\n' "$YEL" "$RST"; continue
+    fi
     user=$(printf '%s' "${email%%@*}" | tr -c 'A-Za-z0-9_-' '_'); user=${user:0:20}
     [ "${#user}" -ge 3 ] || user="admin"
     for try in 1 2 3; do
@@ -1037,8 +1041,8 @@ update_mine_panel() {
 install_mine_panel() {
   local update=0
   panel_installed && update=1
-  STAGE_TOTAL=8; STAGE_DONE=0
-  if [ -e "$PANEL_DIR" ] || (( update )); then
+  STAGE_TOTAL=7; STAGE_DONE=0
+  if (( update )); then
     printf '  %s%s%s Mine Panel is already installed - this will UPDATE it.\n' "$YEL" "$WRN" "$RST"
     ask_yn "Update now? Your data, servers and admin login are kept." || return 2
   fi
@@ -1048,7 +1052,10 @@ install_mine_panel() {
   stage "Downloading Mine Panel (zip)" panel_fetch_zip || return 1
   stage "Checking panel files" panel_check_src || return 1
   stage "Installing Node.js, Python, Java" panel_deps || return 1
-  (( update )) && { stage "Backing up database" panel_backup || return 1; }
+  if (( update )); then
+    STAGE_TOTAL=$(( STAGE_TOTAL + 1 ))
+    stage "Backing up database" panel_backup || return 1
+  fi
   stage "Installing panel files" panel_files || return 1
   stage "Starting panel service" panel_service || return 1
   if panel_admin_exists; then
@@ -1082,28 +1089,67 @@ cf_status() {
   if cf_service_exists; then
     if systemctl is-active --quiet cloudflared 2>/dev/null; then echo "installed - tunnel running"
     else echo "installed - tunnel NOT running"; fi
-  elif cf_installed; then echo "cloudflared installed - no tunnel connected"
+  elif cf_installed; then
+    if pgrep -x cloudflared >/dev/null 2>&1; then echo "cloudflared installed - tunnel running (no systemd)"
+    else echo "cloudflared installed - no tunnel connected"; fi
   else echo "not installed"; fi
 }
 
-cf_install_pkg() {   # official Cloudflare package repo (apt / dnf / yum)
+cf_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l|armv8l|armhf) echo arm ;;
+    armv6l) echo arm ;;
+    i386|i686) echo 386 ;;
+    *) echo "" ;;
+  esac
+}
+
+# Fallback: download the official binary straight from GitHub releases (no apt key needed)
+cf_install_bin() {
+  local arch url
+  arch=$(cf_arch); [ -n "$arch" ] || { echo "unsupported CPU: $(uname -m)"; return 1; }
+  url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 15 "$url" -o /usr/local/bin/cloudflared.new \
+    || { rm -f /usr/local/bin/cloudflared.new; echo "cannot download cloudflared binary"; return 1; }
+  chmod 0755 /usr/local/bin/cloudflared.new && mv -f /usr/local/bin/cloudflared.new /usr/local/bin/cloudflared || return 1
+  cf_installed || { echo "cloudflared binary not in PATH (/usr/local/bin)"; return 1; }
+}
+
+cf_install_pkg() {   # official Cloudflare package repo (apt / dnf / yum), binary fallback
   export DEBIAN_FRONTEND=noninteractive
+  local ok=0
   case $PM in
     apt)
-      mkdir -p --mode=0755 /usr/share/keyrings || return 1
-      curl --proto '=https' --tlsv1.2 -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-        -o /usr/share/keyrings/cloudflare-main.gpg || { echo "cannot download the Cloudflare key"; return 1; }
-      printf 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main\n' \
-        >/etc/apt/sources.list.d/cloudflared.list || return 1
-      apt-get update -y >>"$LOG_FILE" 2>&1 || { echo "apt update failed (see log)"; return 1; }
-      apt-get install -y cloudflared >>"$LOG_FILE" 2>&1 || { echo "cloudflared install failed (see log)"; return 1; }
+      # Cloudflare rotated its signing key: current one is cloudflare-public-v2.gpg
+      # (old cloudflare-main.gpg makes 'apt-get update' fail with a signature error).
+      if mkdir -p --mode=0755 /usr/share/keyrings \
+         && curl --proto '=https' --tlsv1.2 -fsSL --retry 2 https://pkg.cloudflare.com/cloudflare-public-v2.gpg \
+              -o /usr/share/keyrings/cloudflare-public-v2.gpg \
+         && printf 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main\n' \
+              >/etc/apt/sources.list.d/cloudflared.list; then
+        rm -f /usr/share/keyrings/cloudflare-main.gpg
+        # update may print errors for unrelated broken repos - only the install result matters
+        apt-get update -y >>"$LOG_FILE" 2>&1 || log "apt-get update returned errors (continuing)"
+        apt-get install -y cloudflared >>"$LOG_FILE" 2>&1 && ok=1
+      fi
+      if (( ! ok )); then
+        log "cloudflared apt install failed - removing repo and using GitHub binary"
+        rm -f /etc/apt/sources.list.d/cloudflared.list /usr/share/keyrings/cloudflare-public-v2.gpg
+        apt-get update -y >>"$LOG_FILE" 2>&1 || true
+      fi
       ;;
     dnf|yum)
-      curl --proto '=https' --tlsv1.2 -fsSL https://pkg.cloudflare.com/cloudflared.repo \
-        -o /etc/yum.repos.d/cloudflared.repo || { echo "cannot download the Cloudflare repo file"; return 1; }
-      "$PM" install -y cloudflared >>"$LOG_FILE" 2>&1 || { echo "cloudflared install failed (see log)"; return 1; }
+      curl --proto '=https' --tlsv1.2 -fsSL --retry 2 https://pkg.cloudflare.com/cloudflared.repo \
+        -o /etc/yum.repos.d/cloudflared.repo \
+        && "$PM" install -y cloudflared >>"$LOG_FILE" 2>&1 && ok=1
+      (( ok )) || { log "cloudflared rpm install failed - using GitHub binary"; rm -f /etc/yum.repos.d/cloudflared.repo; }
       ;;
   esac
+  if ! cf_installed; then
+    cf_install_bin || return 1
+  fi
   cf_installed || { echo "cloudflared still missing after install"; return 1; }
   echo "cloudflared $(cloudflared --version 2>/dev/null | awk '{print $3}')"
 }
@@ -1130,25 +1176,46 @@ cf_ask_token() {
   done
 }
 
+cf_has_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+
 cf_service_install() {
   [ -n "${CF_TOKEN:-}" ] || { echo "no token provided"; return 1; }
   local out
-  if cf_service_exists; then cloudflared service uninstall >>"$LOG_FILE" 2>&1 || true; fi
-  if ! out=$(cloudflared service install "$CF_TOKEN" 2>&1); then
-    out=${out//"$CF_TOKEN"/***}                      # never show / log the token
-    log "cloudflared service install failed: ${out##*$'\n'}"
-    echo "service install failed: ${out##*$'\n'}"; return 1
+  if cf_has_systemd; then
+    if cf_service_exists; then cloudflared service uninstall >>"$LOG_FILE" 2>&1 || true; fi
+    if ! out=$(cloudflared service install "$CF_TOKEN" 2>&1); then
+      out=${out//"$CF_TOKEN"/***}                      # never show / log the token
+      log "cloudflared service install failed: ${out##*$'\n'}"
+      echo "service install failed: ${out##*$'\n'}"; return 1
+    fi
+    systemctl enable cloudflared >>"$LOG_FILE" 2>&1 || true
+    systemctl restart cloudflared >>"$LOG_FILE" 2>&1 || systemctl start cloudflared >>"$LOG_FILE" 2>&1 || true
+    echo "cloudflared service installed"
+  else
+    # No systemd (some containers / LXC): run the tunnel directly in the background
+    pkill -x cloudflared >/dev/null 2>&1 || true
+    mkdir -p /var/log
+    setsid nohup cloudflared tunnel --no-autoupdate run --token "$CF_TOKEN" \
+      >>/var/log/cloudflared.log 2>&1 </dev/null &
+    disown 2>/dev/null || true
+    log "no systemd - started cloudflared in background (log: /var/log/cloudflared.log)"
+    echo "no systemd: tunnel started in background (will not auto-start after reboot)"
   fi
-  echo "cloudflared service installed"
 }
 
 cf_verify() {
   local i
-  for i in $(seq 1 20); do
-    systemctl is-active --quiet cloudflared 2>/dev/null && { echo "cloudflared service is running"; return 0; }
+  for i in $(seq 1 25); do
+    if cf_has_systemd; then
+      systemctl is-active --quiet cloudflared 2>/dev/null && { echo "cloudflared service is running"; return 0; }
+    else
+      pgrep -x cloudflared >/dev/null 2>&1 && { echo "cloudflared is running (no systemd)"; return 0; }
+    fi
     sleep 1
   done
-  echo "service not running - see: journalctl -u cloudflared -n 50 --no-pager"; return 1
+  if cf_has_systemd; then echo "service not running - see: journalctl -u cloudflared -n 50 --no-pager"
+  else echo "tunnel not running - see: tail -n 50 /var/log/cloudflared.log"; fi
+  return 1
 }
 
 cf_open_hint() {
@@ -1165,7 +1232,7 @@ install_cloudflare() {
     ask_yn "Replace it with a new token?" || return 2
   fi
   printf '\n'
-  stage    "Preflight: disk & network"  preflight "https://pkg.cloudflare.com/cloudflare-main.gpg" || return 1
+  stage    "Preflight: disk & network"  preflight "https://pkg.cloudflare.com/cloudflare-public-v2.gpg" || return 1
   stage    "Installing cloudflared"     cf_install_pkg || return 1
   stage_fg "Tunnel token"               cf_ask_token   || { CF_TOKEN=""; return 1; }
   stage    "Connecting tunnel (service)" cf_service_install || { CF_TOKEN=""; return 1; }
@@ -1185,7 +1252,7 @@ cf_service_remove() {
     systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
     echo "tunnel service removed"
   else
-    echo "no tunnel service found"
+    pkill -x cloudflared >/dev/null 2>&1 && echo "background tunnel stopped" || echo "no tunnel service found"
   fi
 }
 
@@ -1200,7 +1267,7 @@ cf_pkg_remove() {
 }
 
 cf_clean() {
-  rm -f /etc/apt/sources.list.d/cloudflared.list /usr/share/keyrings/cloudflare-main.gpg /etc/yum.repos.d/cloudflared.repo
+  rm -f /etc/apt/sources.list.d/cloudflared.list /usr/share/keyrings/cloudflare-main.gpg /usr/share/keyrings/cloudflare-public-v2.gpg /etc/yum.repos.d/cloudflared.repo /var/log/cloudflared.log
   rm -rf /etc/cloudflared
   rm -f "$STATE_DIR/cloudflare.installed"
   echo "repo, key and /etc/cloudflared cleaned"
