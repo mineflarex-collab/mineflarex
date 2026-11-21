@@ -51,21 +51,6 @@ cleanup() {
   [ -n "${TMP:-}" ] && rm -rf "$TMP"
 }
 
-load_prefs() {   # saved choices from the T / U keys
-  local f="$STATE_DIR/prefs" v
-  [ -r "$f" ] || return 0
-  v=$(sed -n 's/^COLOR=//p' "$f" 2>/dev/null | head -n1)
-  [[ $v =~ ^(16|256|true|mono)$ ]] && PREF_COLOR=$v
-  v=$(sed -n 's/^UNICODE=//p' "$f" 2>/dev/null | head -n1)
-  [[ $v =~ ^[01]$ ]] && PREF_UNI=$v
-  return 0
-}
-
-save_prefs() {
-  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
-  printf 'COLOR=%s\nUNICODE=%s\n' "${PREF_COLOR:-16}" "${PREF_UNI:-1}" >"$STATE_DIR/prefs" 2>/dev/null || true
-}
-
 setup_locale() {
   UTF=0
   case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
@@ -87,36 +72,37 @@ setup_locale() {
 }
 
 setup_theme() {
-  # Default = classic 8-color ANSI (30-37 + bold): works on EVERY terminal/SSH app.
-  # Truecolor only when the terminal itself announces it (COLORTERM).
-  # Force a mode:  MFX_COLOR=true | 256 | 16 | mono   (or press T inside the installer)
-  local mode="${MFX_COLOR:-${PREF_COLOR:-auto}}"
+  # Fully automatic - nothing to choose. Best mode is detected from the terminal.
+  # (Advanced) force a mode:  MFX_COLOR=true | 256 | 16 | mono
+  local mode="${MFX_COLOR:-auto}"
   if [ "$mode" = auto ]; then
-    if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-dumb}" = dumb ]; then mode=mono; else mode=16; fi
+    if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-dumb}" = dumb ]; then mode=mono
+    elif [[ ${COLORTERM:-} == *truecolor* || ${COLORTERM:-} == *24bit* ]]; then mode=true
+    elif [[ ${TERM:-} == *256color* || ${TERM:-} == xterm* || ${TERM:-} == screen* || ${TERM:-} == tmux* ]]; then mode=256
+    else mode=16; fi
   fi
   case "$mode" in
-    true)   # deep violet background + neon purple gradient
-      P=$'\e[38;2;181;101;255m'
-      SH=($'\e[38;2;221;200;255m' $'\e[38;2;196;150;255m' $'\e[38;2;181;101;255m' $'\e[38;2;157;64;245m' $'\e[38;2;131;40;220m')
-      BGC=$'\e[48;2;10;5;22m'
-      DIM=$'\e[38;2;160;145;200m'
-      WHT=$'\e[38;5;83m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+    true)   # neon cyberpunk: hot pink -> violet -> electric cyan on a deep night background
+      P=$'\e[38;2;170;110;255m'
+      SH=($'\e[38;2;255;105;220m' $'\e[38;2;205;115;255m' $'\e[38;2;140;125;255m' $'\e[38;2;80;175;255m' $'\e[38;2;0;230;255m')
+      BGC=$'\e[48;2;8;4;20m'
+      DIM=$'\e[38;2;150;140;195m'
+      WHT=$'\e[38;2;242;238;255m'; GRN=$'\e[38;2;80;255;140m'; RED=$'\e[38;2;255;85;110m'; YEL=$'\e[38;2;255;215;90m' ;;
     256)
-      P=$'\e[38;5;135m'
-      SH=($'\e[38;5;189m' $'\e[38;5;183m' $'\e[38;5;177m' $'\e[38;5;141m' $'\e[38;5;135m')
+      P=$'\e[38;5;141m'
+      SH=($'\e[38;5;213m' $'\e[38;5;177m' $'\e[38;5;141m' $'\e[38;5;75m' $'\e[38;5;51m')
       BGC=$'\e[40m'
-      DIM=$'\e[38;5;103m'
-      WHT=$'\e[38;5;83m'; GRN=$'\e[38;5;83m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
-    mono)   # no colors at all (NO_COLOR / dumb terminals / user choice)
+      DIM=$'\e[38;5;146m'
+      WHT=$'\e[38;5;255m'; GRN=$'\e[38;5;84m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+    mono)
       P=""; SH=("" "" "" "" ""); BGC=""; DIM=""; WHT=""; GRN=""; RED=""; YEL="" ;;
-    *)      # universal 8-color mode: ONLY plain 30-37 codes, no bold/bright
-            # (some terminal themes turn bold/bright colors white)
+    *)      # old 8-color terminals: plain 30-37 codes only
       mode=16
       P=$'\e[35m'
-      SH=($'\e[35m' $'\e[35m' $'\e[35m' $'\e[35m' $'\e[35m')
+      SH=($'\e[35m' $'\e[35m' $'\e[36m' $'\e[36m' $'\e[36m')
       BGC=$'\e[40m'
       DIM=$'\e[36m'
-      WHT=$'\e[32m'; GRN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m' ;;
+      WHT=$'\e[37m'; GRN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m' ;;
   esac
   THEME_MODE=$mode
   case "$mode" in 16) BLD="" ;; mono) BLD=$'\e[1m'; [ "${TERM:-dumb}" = dumb ] && BLD="" ;; *) BLD=$'\e[1m' ;; esac
@@ -159,9 +145,16 @@ rep() { local n=$2 s; (( n <= 0 )) && return 0; printf -v s '%*s' "$n" ''; print
 # ----------------------------------------------------------------------------
 #  Box drawing
 # ----------------------------------------------------------------------------
-box_top() { printf '%*s%s%s%s%s%s\n' "$PAD" '' "$P" "$TL" "$(rep "$H" $((W-2)))" "$TR" "$RST"; }
-box_bot() { printf '%*s%s%s%s%s%s\n' "$PAD" '' "$P" "$BL" "$(rep "$H" $((W-2)))" "$BR" "$RST"; }
-box_sep() { printf '%*s%s%s%s%s%s\n' "$PAD" '' "$P" "$ML" "$(rep "$H" $((W-2)))" "$MR" "$RST"; }
+grad_line() {   # left_char fill_char right_char : pink -> cyan gradient border line
+  local n=$(( W - 2 )) i out="" 
+  out+="${SH[0]}$1"
+  for (( i = 0; i < n; i++ )); do out+="${SH[$(( i * 5 / n ))]}$2"; done
+  out+="${SH[4]}$3"
+  printf '%*s%s%s\n' "$PAD" '' "$out" "$RST"
+}
+box_top() { grad_line "$TL" "$H" "$TR"; }
+box_bot() { grad_line "$BL" "$H" "$BR"; }
+box_sep() { grad_line "$ML" "$H" "$MR"; }
 
 box_raw_l() {  # colored_text visible_len
   local txt=$1 sp=$(( W - 4 - $2 ))
@@ -182,7 +175,7 @@ box_kv() {     # key label desc
   printf -v lab '%-16s' "$2"
   room=$(( W - 4 - ${#key} - 1 - ${#lab} - 1 ))
   desc=${desc:0:$(( room > 0 ? room : 0 ))}
-  box_raw_l "${P}${BLD}${key}${RST} ${WHT}${lab}${RST} ${DIM}${desc}${RST}" $(( ${#key} + 1 + ${#lab} + 1 + ${#desc} ))
+  box_raw_l "${SH[0]}${BLD}${key}${RST} ${WHT}${BLD}${lab}${RST} ${DIM}${desc}${RST}" $(( ${#key} + 1 + ${#lab} + 1 + ${#desc} ))
 }
 
 # ----------------------------------------------------------------------------
@@ -227,6 +220,7 @@ build_logo() {
       LOGO+=("${line% }")
     done
     LOGO_W=${#LOGO[0]}
+    LOGO_RAW=("${LOGO[@]}")
     for r in 0 1 2; do          # left-to-right purple gradient
       line=${LOGO[r]}; n=${#line}; out="$BLD"
       for (( i = 0; i < n; i++ )); do
@@ -246,7 +240,7 @@ build_logo() {
 }
 
 header_full() {
-  clear_screen "$(( (ROWS - (LOGO_H + 17)) / 2 ))"
+  clear_screen "$(( (ROWS - (LOGO_H + 18)) / 2 ))"
   box_top
   box_blank
   if (( W >= LOGO_W + 4 )); then
@@ -258,6 +252,7 @@ header_full() {
   box_blank
   box_center "Advanced VPS & Hosting Management" "$WHT"
   box_center "v$MFX_VERSION  |  mineflarex.indevs.in" "$DIM"
+  (( UTF )) && box_center "★  One command  •  Full setup  •  Zero stress  ★" "$P$BLD"
   box_sep
 }
 
@@ -525,6 +520,20 @@ spl_check() {  # rc label detail
   SPL_N=$(( SPL_N + 1 ))
 }
 
+logo_shine() {   # x : a bright highlight sweeps over the logo
+  local x=$1 r line n i c out d
+  for (( r = 0; r < LOGO_H; r++ )); do
+    line=${LOGO_RAW[r]}; n=${#line}; out="$BLD"
+    for (( i = 0; i < n; i++ )); do
+      c=${line:i:1}
+      if [ "$c" = " " ]; then out+=" "; continue; fi
+      d=$(( i - x )); (( d < 0 )) && d=$(( -d ))
+      if (( d <= 1 )); then out+="${WHT}${c}"; else out+="${SH[$(( i * 5 / n ))]}${c}"; fi
+    done
+    spl_line $(( LOGO_ROW + r )) "$LOGO_W" "${out}${RST}"
+  done
+}
+
 splash_init() {
   local L=$LOGO_H total r i v rw out
   (( COLS < LOGO_W + 4 )) && L=1
@@ -534,6 +543,11 @@ splash_init() {
   printf '\e[?25l'
   if (( L == LOGO_H )); then
     for (( i = 0; i < L; i++ )); do spl_line $(( r + i )) "$LOGO_W" "${LOGO[i]}${RST}"; sleep 0.07; done
+    if (( UTF )); then
+      LOGO_ROW=$r
+      for (( i = -2; i < LOGO_W + 3; i += 3 )); do logo_shine "$i"; sleep 0.015; done
+      logo_shine 9999
+    fi
   else
     spl_line "$r" 19 "${P}${BLD}M I N E F L A R E X${RST}"
   fi
@@ -597,7 +611,7 @@ boot() {
   BOOT_SOFT=1
   boot_step "Checking network"         chk_net  || log "network check failed - downloads may fail later"
   BOOT_SOFT=0
-  spl_line "$SPL_STAT" $(( ${#OK} + 1 + 5 )) "${GRN}${BLD}${OK}${RST} ${WHT}${BLD}Ready${RST}"
+  spl_line "$SPL_STAT" $(( ${#OK} + 1 + 14 )) "${GRN}${BLD}${OK}${RST} ${WHT}${BLD}Ready - let's go!${RST}"
   sleep 0.7
   printf '\e[?25h'
 }
@@ -695,6 +709,21 @@ confirm_install() {
   ask_yn "Proceed with installation of $CUR_TITLE?"
 }
 
+celebrate() {   # short sparkle burst on success
+  (( UTF )) || return 0
+  local i k line
+  local sp=('✦' '✧' '★' '✺' '✹' '·')
+  printf '\e[?25l'
+  for i in 1 2 3 4 5 6; do
+    line=""
+    for (( k = 0; k < W - 2; k++ )); do
+      if (( RANDOM % 7 == 0 )); then line+="${SH[RANDOM % 5]}${sp[RANDOM % 6]}"; else line+=" "; fi
+    done
+    printf '\r%*s%s%s' "$PAD" '' "$line" "$RST"; sleep 0.09
+  done
+  printf '\r\e[K\e[?25h'
+}
+
 run_install() {
   REDRAW=""
   header_small "$CUR_TITLE - INSTALLING"
@@ -705,7 +734,7 @@ run_install() {
   log "=== END $CUR_KEY rc=$rc ==="
   printf '\n'
   case $rc in
-    0) box_top; box_center "INSTALLATION COMPLETE" "$GRN$BLD"; box_center "$CUR_TITLE installed successfully" "$WHT"
+    0) celebrate; box_top; box_center "$( (( UTF )) && printf "★ INSTALLATION COMPLETE ★" || printf "INSTALLATION COMPLETE")" "$GRN$BLD"; box_center "$CUR_TITLE installed successfully" "$WHT"
        box_row "Log: $LOG_FILE" "$DIM"; box_bot ;;
     2) printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST" ;;
     *) printf '  %s%sINSTALLATION FAILED%s - see details above.\n  Log: %s\n' "$RED" "$BLD" "$RST" "$LOG_FILE" ;;
@@ -1257,61 +1286,24 @@ screen_welcome() {
   box_row "CPU     : $cpu core(s)    RAM: $ram    Free disk: $disk" "$WHT"
   box_row "Log     : $LOG_FILE" "$DIM"
   box_blank
-  box_row "Display looks wrong?  T = change colors   U = ASCII symbols" "$DIM"
+  box_row "Fast  |  Secure  |  One-command setup" "$P"
   box_bot
   printf '\n%*s%sPress any key to open the main menu...%s' "$PAD" '' "$DIM" "$RST"
 }
 
-color_check() {   # first run only: ask whether this SSH client really shows colors
-  [ -n "${MFX_COLOR:-}" ] && return 0
-  [ -n "$PREF_COLOR" ] && return 0
-  [ -n "${NO_COLOR:-}" ] && return 0
-  [ "${TERM:-dumb}" = dumb ] && return 0
-  local r t1 t2 t3
-  r=$(( (ROWS - 9) / 2 + 1 )); (( r < 1 )) && r=1
-  t1="DISPLAY CHECK"
-  t2="Do you see colors on the line below?"
-  t3="PURPLE  GREEN  YELLOW  RED"
-  clear_screen 0
-  spl_line "$r" "${#t1}" "${P}${BLD}${t1}${RST}"
-  spl_line $(( r + 2 )) "${#t2}" "${WHT}${t2}${RST}"
-  spl_line $(( r + 4 )) "${#t3}" "${P}PURPLE${RST}  ${GRN}GREEN${RST}  ${YEL}YELLOW${RST}  ${RED}RED${RST}"
-  spl_line $(( r + 6 )) 38 "${WHT}Y = yes, I see colors${RST}"
-  spl_line $(( r + 7 )) 38 "${WHT}N = no, everything is white${RST}"
-  REDRAW=""
-  read_key || return 0
-  case $KEY in
-    y|Y) PREF_COLOR=16 ;;
-    *)   PREF_COLOR=mono ;;
-  esac
-  setup_theme; build_logo; save_prefs
-  clear_screen 0
-}
-
-cycle_theme() {   # T key: 16 -> 256 -> true -> mono
-  local order=(16 256 true mono) i next=0
-  for i in "${!order[@]}"; do [ "${order[i]}" = "$THEME_MODE" ] && next=$(( (i + 1) % ${#order[@]} )); done
-  PREF_COLOR=${order[next]}; unset MFX_COLOR
-  setup_theme; build_logo; save_prefs
-}
-
-toggle_unicode() {   # U key: Unicode <-> plain ASCII symbols
-  if (( UTF )); then PREF_UNI=0; else PREF_UNI=1; fi
-  unset MFX_UNICODE
-  setup_locale; setup_theme; build_logo; save_prefs
-}
-
 draw_main_menu() {
   header_full
-  box_center "SELECT AN INSTALLATION" "$WHT$BLD"
+  box_center "$( (( UTF )) && printf "◈  SELECT AN INSTALLATION  ◈" || printf "SELECT AN INSTALLATION")" "$P$BLD"
   box_blank
-  box_kv "[1]" "BVM VPS BOT"   "VPS automation bot"
-  box_kv "[2]" "MINE PANEL"    "Minecraft + Bot hosting panel"
-  box_kv "[3]" "CLOUDFLARE"    "Cloudflare tunnel (install / uninstall)"
+  local i1="" i2="" i3="" i0=""
+  if (( UTF )); then i1="◆ "; i2="▣ "; i3="◉ "; i0="✕ "; fi
+  box_kv "[1]" "${i1}BVM VPS BOT"   "VPS automation bot"
+  box_kv "[2]" "${i2}MINE PANEL"    "Minecraft + Bot hosting panel"
+  box_kv "[3]" "${i3}CLOUDFLARE"    "Cloudflare tunnel (install / uninstall)"
   box_blank
-  box_kv "[0]" "EXIT" ""
+  box_kv "[0]" "${i0}EXIT" ""
   box_blank
-  box_row "T = colors (now: $THEME_MODE)   U = Unicode/ASCII symbols" "$DIM"
+  box_row "Just press the number - no Enter needed" "$DIM"
   box_bot
   [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
   printf '\n%*s%sEnter choice [1-3, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
@@ -1330,8 +1322,6 @@ main_menu() {
       2) module_mine_panel ;;
       3) module_cloudflare ;;
       0|q|Q) do_exit ;;
-      t|T) cycle_theme ;;
-      u|U) toggle_unicode ;;
       $'\e') drain_esc; MSG="Invalid input. Please press 1, 2, 3 or 0." ;;
       "") MSG="Please press 1, 2, 3 or 0." ;;
       *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Please press 1, 2, 3 or 0." ;;
@@ -1344,7 +1334,6 @@ main() {
   trap cleanup EXIT
   trap 'exit 130' INT TERM
   trap 'RESIZED=1' WINCH
-  load_prefs
   setup_locale
   setup_theme
   update_dims
@@ -1352,18 +1341,10 @@ main() {
   TMP=$(mktemp -d /tmp/mineflarex.XXXXXX) || { leave_fullscreen; echo "mktemp failed"; exit 1; }
   build_logo
   detect_pm || true
-  color_check
   boot
   REDRAW=screen_welcome
   screen_welcome
-  while true; do
-    read_key || exit 0
-    case $KEY in
-      t|T) cycle_theme; screen_welcome ;;
-      u|U) toggle_unicode; screen_welcome ;;
-      *) break ;;
-    esac
-  done
+  read_key || exit 0
   main_menu
 }
 
