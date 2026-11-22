@@ -54,6 +54,14 @@ cleanup() {
   [ -n "${TMP:-}" ] && rm -rf "$TMP"
 }
 
+apt_update() {   # a broken third-party repo must not stop an install: retry once, then continue with cached indexes
+  apt-get update -y >>"$LOG_FILE" 2>&1 && return 0
+  log "apt-get update reported errors - retrying once"
+  sleep 3
+  apt-get update -y >>"$LOG_FILE" 2>&1 || log "apt-get update still reports errors (some repository failed) - continuing with cached indexes"
+  return 0
+}
+
 setup_locale() {
   UTF=0
   case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
@@ -61,6 +69,13 @@ setup_locale() {
   esac
   if (( ! UTF )) && locale -a 2>/dev/null | grep -qi '^c\.utf'; then
     export LC_ALL=C.UTF-8; UTF=1
+  fi
+  if (( UTF )); then
+    local _t='◆'
+    if (( ${#_t} != 1 )); then
+      locale -a 2>/dev/null | grep -qi '^c\.utf' && export LC_ALL=C.UTF-8
+      _t='◆'; (( ${#_t} == 1 )) || UTF=0
+    fi
   fi
   case "${MFX_UNICODE:-$PREF_UNI}" in 0) UTF=0 ;; esac
   if (( UTF )); then
@@ -478,7 +493,7 @@ ensure_deps() {
   log "Missing dependencies: ${need[*]}"
   (
     case $PM in
-      apt) apt-get update -y && apt-get install -y curl coreutils gawk grep sed tar ncurses-bin ;;
+      apt) apt_update && apt-get install -y curl coreutils gawk grep sed tar ncurses-bin ;;
       dnf) dnf install -y curl coreutils gawk grep sed tar ncurses ;;
       yum) yum install -y curl coreutils gawk grep sed tar ncurses ;;
     esac
@@ -686,7 +701,7 @@ ensure_git() {
   if command -v git >/dev/null 2>&1; then echo "git $(git --version | awk '{print $3}')"; return 0; fi
   (
     case $PM in
-      apt) apt-get update -y && apt-get install -y git ;;
+      apt) apt_update && apt-get install -y git ;;
       dnf) dnf install -y git ;;
       yum) yum install -y git ;;
     esac
@@ -942,7 +957,7 @@ panel_check_os() {
 
 panel_fetch_zip() {  # download minepanel.zip -> $PANEL_DIR (HTTPS only; keeps nothing but the files)
   [[ $PANEL_ZIP_URL == https://* ]] || { echo "Refusing non-HTTPS zip URL: $PANEL_ZIP_URL"; return 1; }
-  command -v unzip >/dev/null 2>&1 || { apt-get update -y >>"$LOG_FILE" 2>&1; apt-get install -y unzip >>"$LOG_FILE" 2>&1; }
+  command -v unzip >/dev/null 2>&1 || { apt_update; apt-get install -y unzip >>"$LOG_FILE" 2>&1; }
   command -v unzip >/dev/null 2>&1 || { echo "unzip could not be installed (see log)"; return 1; }
   local tmp z src
   tmp=$(mktemp -d) || return 1
@@ -971,7 +986,7 @@ panel_check_src() {
 
 panel_deps() {   # Node.js 22 + Python 3 (Python bots) + Java (Minecraft)
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >>"$LOG_FILE" 2>&1 || { echo "apt update failed (see log)"; return 1; }
+  apt_update
   apt-get install -y curl ca-certificates gnupg openssl python3 python3-pip python3-venv >>"$LOG_FILE" 2>&1 \
     || { echo "could not install base packages (see log)"; return 1; }
   apt-get install -y openjdk-21-jre-headless >>"$LOG_FILE" 2>&1 \
@@ -1443,13 +1458,13 @@ cf_install_pkg() {   # official Cloudflare package repo (apt / dnf / yum), binar
               >/etc/apt/sources.list.d/cloudflared.list; then
         rm -f /usr/share/keyrings/cloudflare-main.gpg
         # update may print errors for unrelated broken repos - only the install result matters
-        apt-get update -y >>"$LOG_FILE" 2>&1 || log "apt-get update returned errors (continuing)"
+        apt_update
         apt-get install -y cloudflared >>"$LOG_FILE" 2>&1 && ok=1
       fi
       if (( ! ok )); then
         log "cloudflared apt install failed - removing repo and using GitHub binary"
         rm -f /etc/apt/sources.list.d/cloudflared.list /usr/share/keyrings/cloudflare-public-v2.gpg
-        apt-get update -y >>"$LOG_FILE" 2>&1 || true
+        apt_update
       fi
       ;;
     dnf|yum)
