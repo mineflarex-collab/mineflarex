@@ -5,7 +5,7 @@
 # ============================================================================
 set -uo pipefail
 
-MFX_VERSION="1.0.0"
+MFX_VERSION="1.1.0"
 BASE_URL="${MFX_BASE_URL:-https://mineflarex.indevs.in}"
 BOT_REPO="${MFX_BOT_REPO:-https://github.com/mineflarex-collab/Bvm-v1bot.git}"
 PANEL_ZIP_URL="${MFX_PANEL_ZIP:-$BASE_URL/minepanel.zip}"   # panel is installed from this single zip (no GitHub folders needed)
@@ -38,7 +38,10 @@ BOOT_SOFT=0
 BOOT_TOTAL=5
 BOOT_DONE=0
 SPL_BAR=0; SPL_STAT=0; SPL_CHK=0; SPL_N=0; SPL_PCT=0
-CUR_KEY=""; CUR_TITLE=""; CUR_FN=""; CUR_UPD=""; CUR_INFO=()
+CUR_KEY=""; CUR_TITLE=""; CUR_FN=""; CUR_UPD=""; CUR_REI=""; CUR_USR=""; CUR_INFO=()
+PANEL_WIPE=0
+BOX_DELAY=0
+BDG=""
 
 # ----------------------------------------------------------------------------
 #  Core helpers: logging, locale, theme, screen
@@ -61,11 +64,11 @@ setup_locale() {
   fi
   case "${MFX_UNICODE:-$PREF_UNI}" in 0) UTF=0 ;; esac
   if (( UTF )); then
-    TL='╔'; TR='╗'; BL='╚'; BR='╝'; H='═'; V='║'; ML='╠'; MR='╣'
+    TL='╭'; TR='╮'; BL='╰'; BR='╯'; H='─'; V='│'; ML='├'; MR='┤'; DOT='●'; DOT0='○'
     BLK='█'; BARF='█'; BARE='░'; OK='✔'; BAD='✘'; ARW='▶'; WRN='!'
     SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
   else
-    TL='+'; TR='+'; BL='+'; BR='+'; H='-'; V='|'; ML='+'; MR='+'
+    TL='+'; TR='+'; BL='+'; BR='+'; H='-'; V='|'; ML='+'; MR='+'; DOT='*'; DOT0='-'
     BLK='#'; BARF='#'; BARE='-'; OK='OK'; BAD='XX'; ARW='>'; WRN='!'
     SPIN=('|' '/' '-' '\')
   fi
@@ -82,27 +85,30 @@ setup_theme() {
     else mode=16; fi
   fi
   case "$mode" in
-    true)   # neon cyberpunk: hot pink -> violet -> electric cyan on a deep night background
-      P=$'\e[38;2;170;110;255m'
-      SH=($'\e[38;2;255;105;220m' $'\e[38;2;205;115;255m' $'\e[38;2;140;125;255m' $'\e[38;2;80;175;255m' $'\e[38;2;0;230;255m')
-      BGC=$'\e[48;2;8;4;20m'
-      DIM=$'\e[38;2;150;140;195m'
-      WHT=$'\e[38;2;242;238;255m'; GRN=$'\e[38;2;80;255;140m'; RED=$'\e[38;2;255;85;110m'; YEL=$'\e[38;2;255;215;90m' ;;
+    true)   # purple background, white + lavender text (purple -> white mix)
+      P=$'\e[38;2;214;188;255m'
+      SH=($'\e[38;2;176;128;255m' $'\e[38;2;196;156;255m' $'\e[38;2;216;188;255m' $'\e[38;2;236;222;255m' $'\e[38;2;255;255;255m')
+      BGC=$'\e[48;2;58;26;122m'
+      DIM=$'\e[38;2;203;186;244m'
+      WHT=$'\e[38;2;255;255;255m'; GRN=$'\e[38;2;140;255;196m'; RED=$'\e[38;2;255;140;170m'; YEL=$'\e[38;2;255;228;130m'
+      BDG=$'\e[48;2;246;241;255m\e[38;2;88;40;190m' ;;
     256)
-      P=$'\e[38;5;141m'
-      SH=($'\e[38;5;213m' $'\e[38;5;177m' $'\e[38;5;141m' $'\e[38;5;75m' $'\e[38;5;51m')
-      BGC=$'\e[40m'
-      DIM=$'\e[38;5;146m'
-      WHT=$'\e[38;5;255m'; GRN=$'\e[38;5;84m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m' ;;
+      P=$'\e[38;5;183m'
+      SH=($'\e[38;5;141m' $'\e[38;5;147m' $'\e[38;5;183m' $'\e[38;5;189m' $'\e[38;5;255m')
+      BGC=$'\e[48;5;54m'
+      DIM=$'\e[38;5;189m'
+      WHT=$'\e[38;5;255m'; GRN=$'\e[38;5;121m'; RED=$'\e[38;5;211m'; YEL=$'\e[38;5;229m'
+      BDG=$'\e[48;5;255m\e[38;5;54m' ;;
     mono)
-      P=""; SH=("" "" "" "" ""); BGC=""; DIM=""; WHT=""; GRN=""; RED=""; YEL="" ;;
+      P=""; SH=("" "" "" "" ""); BGC=""; DIM=""; WHT=""; GRN=""; RED=""; YEL=""; BDG=$'\e[7m' ;;
     *)      # old 8-color terminals: plain 30-37 codes only
       mode=16
-      P=$'\e[35m'
-      SH=($'\e[35m' $'\e[35m' $'\e[36m' $'\e[36m' $'\e[36m')
-      BGC=$'\e[40m'
-      DIM=$'\e[36m'
-      WHT=$'\e[37m'; GRN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m' ;;
+      P=$'\e[37m'
+      SH=($'\e[37m' $'\e[37m' $'\e[37m' $'\e[37m' $'\e[37m')
+      BGC=$'\e[45m'
+      DIM=$'\e[37m'
+      WHT=$'\e[37m'; GRN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m'
+      BDG=$'\e[47m\e[35m' ;;
   esac
   THEME_MODE=$mode
   case "$mode" in 16) BLD="" ;; mono) BLD=$'\e[1m'; [ "${TERM:-dumb}" = dumb ] && BLD="" ;; *) BLD=$'\e[1m' ;; esac
@@ -120,7 +126,7 @@ update_dims() {
   [[ $r =~ ^[0-9]+$ ]] || r=24
   [[ $c =~ ^[0-9]+$ ]] || c=80
   ROWS=$r; COLS=$c
-  W=$((COLS - 2)); (( W < 28 )) && W=28
+  W=$((COLS - 2)); (( W > 76 )) && W=76; (( W < 28 )) && W=28
   PAD=$(( (COLS - W) / 2 )); (( PAD < 0 )) && PAD=0
 }
 
@@ -140,6 +146,7 @@ enter_fullscreen() {
 }
 leave_fullscreen() { (( FS )) && printf '\e[0m\e[?25h\e[?1049l'; FS=0; return 0; }
 
+box_tick() { [ "${BOX_DELAY:-0}" = 0 ] || sleep "$BOX_DELAY" 2>/dev/null || true; return 0; }
 rep() { local n=$2 s; (( n <= 0 )) && return 0; printf -v s '%*s' "$n" ''; printf '%s' "${s// /$1}"; }
 
 # ----------------------------------------------------------------------------
@@ -150,7 +157,7 @@ grad_line() {   # left_char fill_char right_char : pink -> cyan gradient border 
   out+="${SH[0]}$1"
   for (( i = 0; i < n; i++ )); do out+="${SH[$(( i * 5 / n ))]}$2"; done
   out+="${SH[4]}$3"
-  printf '%*s%s%s\n' "$PAD" '' "$out" "$RST"
+  printf '%*s%s%s\n' "$PAD" '' "$out" "$RST"; box_tick
 }
 box_top() { grad_line "$TL" "$H" "$TR"; }
 box_bot() { grad_line "$BL" "$H" "$BR"; }
@@ -159,24 +166,40 @@ box_sep() { grad_line "$ML" "$H" "$MR"; }
 box_raw_l() {  # colored_text visible_len
   local txt=$1 sp=$(( W - 4 - $2 ))
   (( sp < 0 )) && sp=0
-  printf '%*s%s%s%s %s%*s %s%s%s\n' "$PAD" '' "$P" "$V" "$RST" "$txt" "$sp" '' "$P" "$V" "$RST"
+  printf '%*s%s%s%s %s%*s %s%s%s\n' "$PAD" '' "$P" "$V" "$RST" "$txt" "$sp" '' "$P" "$V" "$RST"; box_tick
 }
 box_raw_c() {
   local txt=$1 vlen=$2 inner=$(( W - 2 )) lead trail
   lead=$(( (inner - vlen) / 2 )); (( lead < 0 )) && lead=0
   trail=$(( inner - vlen - lead )); (( trail < 0 )) && trail=0
-  printf '%*s%s%s%s%*s%s%*s%s%s%s\n' "$PAD" '' "$P" "$V" "$RST" "$lead" '' "$txt" "$trail" '' "$P" "$V" "$RST"
+  printf '%*s%s%s%s%*s%s%*s%s%s%s\n' "$PAD" '' "$P" "$V" "$RST" "$lead" '' "$txt" "$trail" '' "$P" "$V" "$RST"; box_tick
 }
 box_blank() { box_raw_l "" 0; }
 box_row()    { local t=${1:0:$((W-4))} c=${2:-$WHT}; box_raw_l "$c$t$RST" "${#t}"; }
 box_center() { local t=${1:0:$((W-4))} c=${2:-$WHT}; box_raw_c "$c$t$RST" "${#t}"; }
-box_kv() {     # key label desc
-  local key=$1 lab desc=$3 room
-  printf -v lab '%-16s' "$2"
-  room=$(( W - 4 - ${#key} - 1 - ${#lab} - 1 ))
+box_kv() {     # key label desc   (key shown as [n], digit in bright white)
+  local key=$1 lab desc=$3 room k=${1//[\[\]]/}
+  printf -v lab '%-18s' "$2"
+  room=$(( W - 4 - ${#k} - 2 - 2 - ${#lab} - 1 ))
   desc=${desc:0:$(( room > 0 ? room : 0 ))}
-  box_raw_l "${SH[0]}${BLD}${key}${RST} ${WHT}${BLD}${lab}${RST} ${DIM}${desc}${RST}" $(( ${#key} + 1 + ${#lab} + 1 + ${#desc} ))
+  box_raw_l "${P}${BLD}[${WHT}${k}${P}]${RST}  ${WHT}${BLD}${lab}${RST} ${DIM}${desc}${RST}" $(( ${#k} + 2 + 2 + ${#lab} + 1 + ${#desc} ))
 }
+box_info() {   # label value   (aligned info row)
+  local lab v
+  printf -v lab '%-8s' "$1"
+  v=${2:0:$(( W - 4 - 8 - 3 ))}
+  box_raw_l "${P}${BLD}${lab}${RST} ${DIM}${V}${RST} ${WHT}${v}${RST}" $(( 8 + 3 + ${#v} ))
+}
+grad_text() {  # text -> gradient string (purple -> white)
+  local t=$1 n=${#1} i c out="$BLD"
+  for (( i = 0; i < n; i++ )); do
+    c=${t:i:1}
+    if [ "$c" = " " ]; then out+=" "; else out+="${SH[$(( i * 5 / n ))]}${c}"; fi
+  done
+  printf '%s%s' "$out" "$RST"
+}
+box_grad() { local t=${1:0:$((W-4))}; box_raw_c "$(grad_text "$t")" "${#t}"; }
+draw_anim() { BOX_DELAY=0.018; "$1"; BOX_DELAY=0; }
 
 # ----------------------------------------------------------------------------
 #  Logo / headers
@@ -195,17 +218,17 @@ glyph() {   # classic blocky font (ASCII fallback)
   esac
 }
 
-sglyph() {  # smooth line-art font, 3 rows
+sglyph() {  # bold half-block font, 3 rows
   case $1 in
-    M) G=("╔╦╗" "║║║" "╩ ╩") ;;
-    i) G=("╦" "║" "╩") ;;
-    n) G=("╔╗╔" "║║║" "╝╚╝") ;;
-    e) G=("╔═╗" "║╣ " "╚═╝") ;;
-    F) G=("╔═╗" "╠╣ " "╚  ") ;;
-    l) G=("╦  " "║  " "╩═╝") ;;
-    a) G=("╔═╗" "╠═╣" "╩ ╩") ;;
-    r) G=("╦═╗" "╠╦╝" "╩╚═") ;;
-    X) G=("═╗ ╦" "╔╩╦╝" "╩ ╚═") ;;
+    M) G=("█▀▄▀█" "█ ▀ █" "▀   ▀") ;;
+    I) G=("▀█▀" " █ " "▄█▄") ;;
+    N) G=("█▄ █" "█ ▀█" "▀  ▀") ;;
+    E) G=("█▀▀" "█▀▀" "▀▀▀") ;;
+    F) G=("█▀▀" "█▀▀" "▀  ") ;;
+    L) G=("█  " "█  " "▀▀▀") ;;
+    A) G=("▄▀▄" "█▀█" "▀ ▀") ;;
+    R) G=("█▀▄" "█▀▄" "▀ ▀") ;;
+    X) G=("▀▄▀" " █ " "▄▀▄") ;;
   esac
 }
 
@@ -216,7 +239,7 @@ build_logo() {
     LOGO_H=3
     for r in 0 1 2; do
       line=""
-      for ch in M i n e F l a r e X; do sglyph "$ch"; line+="${G[r]} "; done
+      for ch in M I N E F L A R E X; do sglyph "$ch"; line+="${G[r]} "; done
       LOGO+=("${line% }")
     done
     LOGO_W=${#LOGO[0]}
@@ -250,19 +273,19 @@ header_full() {
     box_center "M I N E F L A R E X" "$P$BLD"
   fi
   box_blank
-  box_center "Advanced VPS & Hosting Management" "$WHT"
-  box_center "v$MFX_VERSION  |  mineflarex.indevs.in" "$DIM"
-  (( UTF )) && box_center "★  One command  •  Full setup  •  Zero stress  ★" "$P$BLD"
+  box_center "ADVANCED VPS & HOSTING MANAGEMENT" "$WHT$BLD"
+  box_center "v$MFX_VERSION  ·  mineflarex.indevs.in" "$DIM"
+  (( UTF )) && box_center "◆  One command  ·  Full setup  ·  Zero stress  ◆" "$P"
   box_sep
 }
 
 header_small() {
   clear_screen
   box_top
-  box_center "M I N E F L A R E X" "$P$BLD"
-  box_center "Advanced VPS & Hosting Management" "$DIM"
+  box_grad "M I N E F L A R E X"
+  box_center "ADVANCED VPS & HOSTING MANAGEMENT" "$DIM"
   box_sep
-  box_center "$1" "$WHT$BLD"
+  box_center "$( (( UTF )) && printf '◆  %s  ◆' "$1" || printf '%s' "$1")" "$WHT$BLD"
   box_sep
 }
 
@@ -299,13 +322,13 @@ ask_yn() {
 bar() {   # pct [width]  - purple gradient fill
   local pct=$1 w=${2:-20} f i out=""
   f=$(( pct * w / 100 ))
-  for (( i = 0; i < f; i++ )); do out+="${SH[$(( 4 - i * 5 / w ))]}${BARF}"; done
+  for (( i = 0; i < f; i++ )); do out+="${SH[$(( i * 5 / f ))]}${BARF}"; done
   printf '%s%s%s%s' "$out" "$DIM" "$(rep "$BARE" $(( w - f )))" "$RST"
 }
 
 spin_run() {   # label cmd...   (cmd runs in background; stdout captured in SPIN_OUT)
   local label=$1; shift
-  local outf pid i=0 pct
+  local outf pid i=0 pct t0=$SECONDS el
   outf=$(mktemp "$TMP/out.XXXXXX")
   printf '\e[?25l'
   "$@" >"$outf" 2>>"$LOG_FILE" &
@@ -317,6 +340,7 @@ spin_run() {   # label cmd...   (cmd runs in background; stdout captured in SPIN
     else
       printf '\r\e[K  %s%s%s %s' "$P" "${SPIN[i % ${#SPIN[@]}]}" "$RST" "$label"
     fi
+    el=$(( SECONDS - t0 )); (( el > 0 )) && printf ' %s%ss%s' "$DIM" "$el" "$RST"
     i=$((i + 1)); sleep 0.1
   done
   wait "$pid"; SPIN_RC=$?
@@ -520,45 +544,61 @@ spl_check() {  # rc label detail
   SPL_N=$(( SPL_N + 1 ))
 }
 
-logo_shine() {   # x : a bright highlight sweeps over the logo
-  local x=$1 r line n i c out d
+logo_shine() {   # x [visible_columns]   (white highlight sweeping over the gradient logo)
+  local x=$1 lim=${2:-9999} r line n i c out d
   for (( r = 0; r < LOGO_H; r++ )); do
     line=${LOGO_RAW[r]}; n=${#line}; out="$BLD"
     for (( i = 0; i < n; i++ )); do
       c=${line:i:1}
-      if [ "$c" = " " ]; then out+=" "; continue; fi
+      if [ "$c" = " " ] || (( i >= lim )); then out+=" "; continue; fi
       d=$(( i - x )); (( d < 0 )) && d=$(( -d ))
-      if (( d <= 1 )); then out+="${WHT}${c}"; else out+="${SH[$(( i * 5 / n ))]}${c}"; fi
+      if (( d <= 2 )); then out+="${WHT}${c}"; else out+="${SH[$(( i * 5 / n ))]}${c}"; fi
     done
     spl_line $(( LOGO_ROW + r )) "$LOGO_W" "${out}${RST}"
   done
 }
 
+spl_type() {   # row text color   (typewriter, centered on its final width)
+  local row=$1 t=$2 c=$3 col i
+  col=$(( (COLS - ${#t}) / 2 + 1 )); (( col < 1 )) && col=1
+  for (( i = 1; i <= ${#t}; i++ )); do
+    printf '\e[%d;%dH%s%s%s' "$row" "$col" "$c" "${t:0:i}" "$RST"; sleep 0.011
+  done
+}
+
+spl_grow() {   # row width   (gradient ruler that draws itself)
+  local row=$1 w=$2 col i
+  col=$(( (COLS - w) / 2 + 1 )); (( col < 1 )) && col=1
+  for (( i = 0; i < w; i++ )); do
+    printf '\e[%d;%dH%s%s%s' "$row" "$(( col + i ))" "${SH[$(( i * 5 / w ))]}" "$H" "$RST"; sleep 0.006
+  done
+}
+
 splash_init() {
-  local L=$LOGO_H total r i v rw out
+  local L=$LOGO_H total r i v rw
   (( COLS < LOGO_W + 4 )) && L=1
   total=$(( L + 12 ))
   r=$(( (ROWS - total) / 2 + 1 )); (( r < 1 )) && r=1
   clear_screen 0
   printf '\e[?25l'
   if (( L == LOGO_H )); then
-    for (( i = 0; i < L; i++ )); do spl_line $(( r + i )) "$LOGO_W" "${LOGO[i]}${RST}"; sleep 0.07; done
     if (( UTF )); then
       LOGO_ROW=$r
-      for (( i = -2; i < LOGO_W + 3; i += 3 )); do logo_shine "$i"; sleep 0.015; done
+      for (( i = 2; i <= LOGO_W + 2; i += 2 )); do logo_shine -99 "$i"; sleep 0.012; done   # reveal left -> right
+      for (( i = -3; i < LOGO_W + 4; i += 2 )); do logo_shine "$i"; sleep 0.009; done        # shine sweep
       logo_shine 9999
+    else
+      for (( i = 0; i < L; i++ )); do spl_line $(( r + i )) "$LOGO_W" "${LOGO[i]}${RST}"; sleep 0.07; done
     fi
   else
     spl_line "$r" 19 "${P}${BLD}M I N E F L A R E X${RST}"
   fi
   r=$(( r + L + 1 ))
-  spl_line "$r" 33 "${WHT}Advanced VPS & Hosting Management${RST}"
-  v="v$MFX_VERSION  |  mineflarex.indevs.in"
+  spl_type "$r" "ADVANCED VPS & HOSTING MANAGEMENT" "${WHT}${BLD}"
+  v="v$MFX_VERSION  ·  mineflarex.indevs.in"
   spl_line $(( r + 1 )) "${#v}" "${DIM}${v}${RST}"
   rw=$(( COLS - 8 )); (( rw > 40 )) && rw=40; (( rw < 12 )) && rw=12
-  out=""
-  for (( i = 0; i < rw; i++ )); do out+="${SH[$(( i * 5 / rw ))]}${H}"; done
-  spl_line $(( r + 2 )) "$rw" "$out"
+  spl_grow $(( r + 2 )) "$rw"
   SPL_BAR=$(( r + 3 )); SPL_STAT=$(( r + 4 )); SPL_CHK=$(( r + 6 ))
   SPL_PCT=0; SPL_N=0
   spl_bar 0
@@ -691,6 +731,8 @@ draw_module_menu() {
   box_kv "[1]" "Start Install"  "Begin installation"
   box_kv "[2]" "View Log"       "Show recent log lines"
   [ -n "$CUR_UPD" ] && box_kv "[3]" "Update"     "Update to the latest version (data is kept)"
+  [ -n "$CUR_REI" ] && box_kv "[4]" "Reinstall"  "Remove and install again from scratch"
+  [ -n "$CUR_USR" ] && box_kv "[5]" "Users"      "Create / delete / view panel users"
   box_kv "[B]" "Back"           "Back to Main Menu"
   box_kv "[0]" "Exit"           ""
   box_bot
@@ -775,17 +817,38 @@ run_update() {
   press_any_key
 }
 
-module_menu() {  # key title install_fn [update_fn]  (CUR_INFO set by caller)
-  CUR_KEY=$1; CUR_TITLE=$2; CUR_FN=$3; CUR_UPD=${4:-}; MSG=""
+run_reinstall() {
+  REDRAW=""
+  header_small "$CUR_TITLE - REINSTALL"
+  box_row "Log: $LOG_FILE" "$DIM"
+  box_bot
+  log "=== BEGIN $CUR_KEY reinstall ==="
+  "$CUR_REI"; local rc=$?
+  log "=== END $CUR_KEY reinstall rc=$rc ==="
+  printf '\n'
+  case $rc in
+    0) celebrate; box_top; box_center "REINSTALL COMPLETE" "$GRN$BLD"; box_center "$CUR_TITLE was reinstalled successfully" "$WHT"
+       box_row "Log: $LOG_FILE" "$DIM"; box_bot ;;
+    2) printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST" ;;
+    *) printf '  %s%sREINSTALL FAILED%s - see details above.\n  Log: %s\n' "$RED" "$BLD" "$RST" "$LOG_FILE" ;;
+  esac
+  press_any_key
+}
+
+module_menu() {  # key title install_fn [update_fn] [reinstall_fn] [users_fn]  (CUR_INFO set by caller)
+  CUR_KEY=$1; CUR_TITLE=$2; CUR_FN=$3; CUR_UPD=${4:-}; CUR_REI=${5:-}; CUR_USR=${6:-}; MSG=""
+  local first=1
   while true; do
     REDRAW=draw_module_menu
-    draw_module_menu
+    if (( first )); then draw_anim draw_module_menu; first=0; else draw_module_menu; fi
     read_key || exit 0
     MSG=""
     case $KEY in
       1) confirm_install && run_install ;;
       2) view_log ;;
-      3) if [ -n "$CUR_UPD" ]; then run_update; else MSG="Invalid option '3'. Use 1, 2, B or 0."; fi ;;
+      3) if [ -n "$CUR_UPD" ]; then run_update; else MSG="Invalid option '3'. Use the numbers shown, B or 0."; fi ;;
+      4) if [ -n "$CUR_REI" ]; then run_reinstall; else MSG="Invalid option '4'. Use the numbers shown, B or 0."; fi ;;
+      5) if [ -n "$CUR_USR" ]; then "$CUR_USR"; else MSG="Invalid option '5'. Use the numbers shown, B or 0."; fi ;;
       b|B) return 0 ;;
       0|q|Q) do_exit ;;
       $'\e') drain_esc; MSG="Invalid input. Use the numbers shown, B or 0." ;;
@@ -830,13 +893,38 @@ update_bvm_bot() {
   mark_installed bvm-bot
   return 0
 }
+bvm_remove_copy() {   # backup the old folder (config/data may live in it), then delete it
+  [ -d "$BOT_DIR" ] || { echo "no old copy found"; return 0; }
+  local b="$STATE_DIR/bvm-bot-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  mkdir -p "$STATE_DIR" || return 1
+  tar -czf "$b" -C "$(dirname "$BOT_DIR")" "$(basename "$BOT_DIR")" 2>>"$LOG_FILE" || { echo "backup failed - nothing was deleted"; return 1; }
+  chmod 600 "$b"
+  rm -rf "${BOT_DIR:?}" || return 1
+  echo "old copy removed, backup: $b"
+}
+reinstall_bvm_bot() {
+  STAGE_TOTAL=6; STAGE_DONE=0
+  printf '  %sThis deletes %s, downloads the bot fresh and runs its install.sh again.%s\n' "$DIM" "$BOT_DIR" "$RST"
+  printf '  %sA backup of the old folder is saved in %s first.%s\n\n' "$DIM" "$STATE_DIR" "$RST"
+  ask_yn "Reinstall BVM VPS BOT now?" || return 2
+  printf '\n'
+  stage "Preflight: disk & network" preflight "https://github.com" || return 1
+  stage "Checking git" ensure_git || return 1
+  stage "Removing old copy (with backup)" bvm_remove_copy || return 1
+  stage "Fetching Bvm-v1bot repository" git_fetch_repo "$BOT_REPO" "$BOT_DIR" || return 1
+  stage "Validating install.sh" validate_script "$BOT_DIR/install.sh" || return 1
+  stage_fg "Running install.sh" run_bot_installer || return 1
+  mark_installed bvm-bot
+  return 0
+}
 module_bvm_bot() {
   CUR_INFO=("BVM VPS bot (Discord)"
             "Repo   : github.com/mineflarex-collab/Bvm-v1bot"
             "Steps  : git clone, validate, run install.sh"
             "Update : [3] pulls the latest code and re-applies it"
+            "Reinst : [4] fresh copy (old folder is backed up)"
             "Needs  : root, git (auto-installed), internet")
-  module_menu bvm-bot "BVM VPS BOT" install_bvm_bot update_bvm_bot
+  module_menu bvm-bot "BVM VPS BOT" install_bvm_bot update_bvm_bot reinstall_bvm_bot
 }
 
 # ============================================================================
@@ -1069,13 +1157,237 @@ install_mine_panel() {
   return 0
 }
 
+# ---- Reinstall: fresh code + service. Optionally wipes ALL data (database, users, servers, bots) ------------
+panel_reinstall_remove() {   # stop + remove service and old code (data/.env are kept unless PANEL_WIPE=1)
+  systemctl stop minepanel >>"$LOG_FILE" 2>&1 || true
+  systemctl disable minepanel >>"$LOG_FILE" 2>&1 || true
+  rm -f /etc/systemd/system/minepanel.service
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+  if (( PANEL_WIPE )); then
+    rm -rf "${PANEL_HOME:?}" || return 1
+    rm -f "$STATE_DIR/mine-panel.installed"
+    echo "panel and ALL data removed"
+  else
+    panel_snapshot || return 1
+    local d; for d in src public scripts deploy tests; do rm -rf "${PANEL_HOME:?}/$d"; done
+    echo "old code removed; data and .env kept"
+  fi
+}
+
+reinstall_mine_panel() {
+  STAGE_TOTAL=7; STAGE_DONE=0; PANEL_WIPE=0
+  if ! panel_installed; then
+    printf '  %s%s%s Mine Panel is not installed yet. Use [1] Start Install first.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sThe panel is removed and installed again from the latest zip.%s\n' "$DIM" "$RST"
+  printf '  %sBy default your database, users, servers, bots and .env are kept.%s\n\n' "$DIM" "$RST"
+  ask_yn "Reinstall Mine Panel now?" || return 2
+  printf '\n  %sOptional: a COMPLETELY clean install (deletes users, servers, bots, database).%s' "$RED" "$RST"
+  if ask_yn "Delete ALL panel data too?"; then
+    ask_yn "Are you sure? This cannot be undone." || return 2
+    PANEL_WIPE=1
+  fi
+  printf '\n'
+  stage "Preflight: disk & network" preflight "$PANEL_ZIP_URL" || return 1
+  stage "Downloading Mine Panel (zip)" panel_fetch_zip || return 1        # live panel is untouched until here
+  stage "Checking panel files" panel_check_src || return 1
+  stage "Installing Node.js, Python, Java" panel_deps || return 1
+  stage "Removing old panel" panel_reinstall_remove || return 1
+  stage "Installing panel files" panel_files || return 1
+  stage "Starting panel service" panel_service || return 1
+  if panel_admin_exists; then
+    printf '  %s%s%s %-34s %skept (already exists)%s\n' "$GRN" "$OK" "$RST" "Admin account" "$DIM" "$RST"
+  else
+    STAGE_TOTAL=$(( STAGE_TOTAL + 1 ))
+    stage_fg "Admin account (email + password)" panel_admin || return 1
+  fi
+  mark_installed mine-panel
+  panel_open_hint
+  return 0
+}
+
+# ---- Users: create / delete / view ---------------------------------------------------------------------------
+mp_users_prepare() {   # writes the helper next to the database (data/ is never replaced by updates)
+  panel_installed || { printf '  %s%s%s Mine Panel is not installed yet. Install it first.\n' "$YEL" "$WRN" "$RST"; return 1; }
+  [ -f "$PANEL_HOME/data/minepanel.db" ] || { printf '  %s%s%s Panel database not found yet - start the panel once, then try again.\n' "$YEL" "$WRN" "$RST"; return 1; }
+  cat >"$PANEL_HOME/data/.mfx-users.js" <<'MFXJS'
+// MineFlareX user helper - list / setrole / delete (schema is auto-detected)
+const { DatabaseSync } = require('node:sqlite');
+const [cmd, a1, a2] = process.argv.slice(2);
+const db = new DatabaseSync(process.env.MFX_DB);
+db.exec('PRAGMA busy_timeout = 5000');
+db.exec('PRAGMA foreign_keys = ON');
+const die = (m, c = 1) => { console.error(m); process.exit(c); };
+const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name);
+const ut = ['users', 'user', 'accounts'].find(t => tables.includes(t));
+if (!ut) die('users table not found (tables: ' + tables.join(', ') + ')', 3);
+const colsOf = t => db.prepare(`PRAGMA table_info("${t}")`).all().map(c => c.name);
+const cols = colsOf(ut);
+const pick = (...n) => n.find(x => cols.includes(x));
+const cId = pick('id', 'user_id'), cEmail = pick('email', 'mail'), cUser = pick('username', 'name', 'user_name'),
+      cRole = pick('role', 'user_role', 'type'), cAdm = pick('is_admin', 'admin', 'isAdmin');
+if (!cId || !cEmail) die('could not find id/email columns in table ' + ut + ' (columns: ' + cols.join(', ') + ')', 3);
+const isAdmin = r => cRole ? /admin/i.test(String(r[cRole] ?? '')) : cAdm ? !!r[cAdm] : false;
+const roleOf = r => cRole || cAdm ? (isAdmin(r) ? 'admin' : 'user') : '-';
+const all = () => db.prepare(`SELECT * FROM "${ut}" ORDER BY "${cId}"`).all();
+const find = e => db.prepare(`SELECT * FROM "${ut}" WHERE lower("${cEmail}") = lower(?)`).get(e || '');
+
+if (cmd === 'list') {
+  for (const r of all()) console.log([r[cId], cUser ? r[cUser] : '-', r[cEmail], roleOf(r)].join('\t'));
+} else if (cmd === 'setrole') {
+  const r = find(a1); if (!r) die('No user with that email', 4);
+  const admin = a2 === 'admin';
+  if (cRole) {
+    let val = 'admin';
+    if (!admin) {
+      const seen = db.prepare(`SELECT DISTINCT "${cRole}" v FROM "${ut}"`).all().map(x => String(x.v)).filter(v => !/admin/i.test(v));
+      val = seen.includes('user') ? 'user' : (seen[0] || 'user');
+    }
+    db.prepare(`UPDATE "${ut}" SET "${cRole}" = ? WHERE "${cId}" = ?`).run(val, r[cId]);
+  } else if (cAdm) {
+    db.prepare(`UPDATE "${ut}" SET "${cAdm}" = ? WHERE "${cId}" = ?`).run(admin ? 1 : 0, r[cId]);
+  } else die('no role/admin column found - cannot change the role', 6);
+  console.log('role set to ' + a2);
+} else if (cmd === 'delete') {
+  const r = find(a1); if (!r) die('No user with that email', 4);
+  if (isAdmin(r) && all().filter(isAdmin).length <= 1) die('Cannot delete the last admin account', 5);
+  const id = r[cId];
+  for (const t of tables) {                       // login sessions / tokens of this user
+    if (t === ut || !/session|token|reset|remember|login/i.test(t)) continue;
+    const c = colsOf(t).find(x => /^(user_?id|userid|user)$/i.test(x));
+    if (c) { try { db.prepare(`DELETE FROM "${t}" WHERE "${c}" = ?`).run(id); } catch (e) {} }
+  }
+  try { db.prepare(`DELETE FROM "${ut}" WHERE "${cId}" = ?`).run(id); }
+  catch (e) { die('Could not delete: this user still owns data (servers/bots). Delete those in the panel first. (' + e.message + ')', 7); }
+  console.log('deleted ' + a1);
+} else die('unknown command', 2);
+MFXJS
+  chown minepanel:minepanel "$PANEL_HOME/data/.mfx-users.js" 2>/dev/null
+  chmod 600 "$PANEL_HOME/data/.mfx-users.js"
+}
+mp_users_run() { ( cd "$PANEL_HOME" && runuser -u minepanel -- env MFX_DB="$PANEL_HOME/data/minepanel.db" node $PANEL_NODE_FLAGS "$PANEL_HOME/data/.mfx-users.js" "$@" 2>&1 ); }
+
+mp_users_show() {   # prints the user table
+  local out line id un em ro n=0
+  out=$(mp_users_run list) || { printf '  %s%s%s\n' "$RED" "$(printf '%s' "$out" | tail -n1)" "$RST"; return 1; }
+  printf '  %s%-5s %-18s %-32s %s%s\n' "$P$BLD" "ID" "USERNAME" "EMAIL" "ROLE" "$RST"
+  while IFS=$'\t' read -r id un em ro; do
+    [ -n "$id" ] || continue
+    n=$((n + 1))
+    printf '  %-5s %-18s %-32s %s\n' "${id:0:5}" "${un:0:18}" "${em:0:32}" "$ro"
+  done <<<"$out"
+  (( n )) || printf '  %sNo users yet.%s\n' "$DIM" "$RST"
+  printf '\n  %sTotal: %d%s\n' "$DIM" "$n" "$RST"
+}
+
+mp_user_view() { mp_users_prepare || return 1; mp_users_show; }
+
+mp_user_create() {
+  mp_users_prepare || return 1
+  [ -r /dev/tty ] || { echo "no terminal available"; return 1; }
+  local admin=0 email pw user out try role=user
+  printf '  %s%sCreate a new user%s\n\n' "$P" "$BLD" "$RST"
+  ask_yn "Should this user be an ADMIN?" && { admin=1; role=admin; }
+  printf '\n'
+  while true; do
+    printf '  %sEmail (gmail):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -r email </dev/tty
+    email=$(printf '%s' "$email" | tr -d '[:space:]')
+    [ -n "$email" ] || { printf '  %sEmail is required.%s\n' "$YEL" "$RST"; continue; }
+    [[ $email =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || { printf '  %sThat does not look like a valid email address.%s\n' "$YEL" "$RST"; continue; }
+    if mp_users_run list | cut -f3 | grep -qix -- "$email"; then printf '  %sThis email already has an account.%s\n' "$YEL" "$RST"; continue; fi
+    printf '  %sPassword (10+ characters, letters + numbers):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -rs pw </dev/tty; printf '\n' >/dev/tty
+    if (( ${#pw} < 10 )) || [[ ! $pw =~ [A-Za-z] ]] || [[ ! $pw =~ [0-9] ]]; then
+      printf '  %sPassword must be 10+ characters and contain both letters and numbers. Try again.%s\n\n' "$YEL" "$RST"; continue
+    fi
+    user=$(printf '%s' "${email%%@*}" | tr -c 'A-Za-z0-9_-' '_'); user=${user:0:20}
+    [ "${#user}" -ge 3 ] || user="user${RANDOM}"
+    for try in 1 2 3; do
+      if out=$( cd "$PANEL_HOME" && runuser -u minepanel -- env ADMIN_PASSWORD="$pw" node $PANEL_NODE_FLAGS scripts/create-admin.js "$email" "$user" 2>&1 ); then
+        if (( ! admin )); then
+          if ! out=$(mp_users_run setrole "$email" user); then
+            mp_users_run delete "$email" >/dev/null 2>&1   # never leave an unwanted admin behind
+            printf '  %s%s%s\n  %sCould not make the account a normal user, so it was removed.%s\n' "$RED" "$(printf '%s' "$out" | tail -n1)" "$RST" "$RED" "$RST"
+            return 1
+          fi
+        fi
+        printf '  %s%s%s User created: %s  (%s)\n' "$GRN" "$OK" "$RST" "$email" "$role"
+        return 0
+      fi
+      if printf '%s' "$out" | grep -qi 'taken'; then user="${user:0:15}$((RANDOM % 9000 + 1000))"; continue; fi
+      break
+    done
+    printf '  %s%s%s\n\n' "$YEL" "$(printf '%s' "$out" | tail -n1)" "$RST"
+    return 1
+  done
+}
+
+mp_user_delete() {
+  mp_users_prepare || return 1
+  [ -r /dev/tty ] || { echo "no terminal available"; return 1; }
+  local email out
+  mp_users_show || return 1
+  printf '\n  %sEmail of the user to delete (empty = cancel):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -r email </dev/tty
+  email=$(printf '%s' "$email" | tr -d '[:space:]')
+  [ -n "$email" ] || { printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST"; return 2; }
+  mp_users_run list | cut -f3 | grep -qix -- "$email" || { printf '  %s%s%s No user with that email.\n' "$YEL" "$WRN" "$RST"; return 1; }
+  ask_yn "Delete $email permanently?" || { printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST"; return 2; }
+  if out=$(mp_users_run delete "$email"); then
+    printf '  %s%s%s User deleted: %s\n' "$GRN" "$OK" "$RST" "$email"; return 0
+  fi
+  printf '  %s%s%s\n' "$RED" "$(printf '%s' "$out" | tail -n1)" "$RST"; return 1
+}
+
+run_user_action() {  # title fn
+  REDRAW=""
+  header_small "$1"
+  box_bot
+  printf '\n'
+  "$2"
+  press_any_key
+}
+
+draw_users_menu() {
+  header_small "MINE PANEL - USERS"
+  box_row "Panel : $(panel_installed && echo installed || echo 'not installed')" "$DIM"
+  box_sep
+  box_kv "[1]" "Create" "New user (admin yes/no, gmail, password)"
+  box_kv "[2]" "Delete" "Delete a user by email"
+  box_kv "[3]" "View"   "List all users"
+  box_kv "[B]" "Back"   "Back to Mine Panel menu"
+  box_bot
+  [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
+  printf '\n%*s%sSelect option:%s ' "$PAD" '' "$P$BLD" "$RST"
+}
+
+module_panel_users() {
+  MSG=""; local first=1
+  while true; do
+    REDRAW=draw_users_menu
+    if (( first )); then draw_anim draw_users_menu; first=0; else draw_users_menu; fi
+    read_key || exit 0
+    MSG=""
+    case $KEY in
+      1) run_user_action "USERS - CREATE" mp_user_create ;;
+      2) run_user_action "USERS - DELETE" mp_user_delete ;;
+      3) run_user_action "USERS - VIEW"   mp_user_view ;;
+      b|B) return 0 ;;
+      0|q|Q) do_exit ;;
+      $'\e') drain_esc; MSG="Invalid input. Use 1, 2, 3 or B." ;;
+      "") MSG="Please press 1, 2, 3 or B." ;;
+      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Use 1, 2, 3 or B." ;;
+    esac
+  done
+}
+
 module_mine_panel() {
   CUR_INFO=("Mine Panel (Minecraft + Bot hosting)"
             "Source : $PANEL_ZIP_URL"
             "Steps  : download zip, install Node/Python/Java, start panel"
             "Last   : asks the admin email + password"
-            "Update : menu [3] keeps all your data")
-  module_menu mine-panel "MINE PANEL" install_mine_panel update_mine_panel
+            "Update : menu [3] keeps all your data"
+            "Reinst : [4] fresh install (data kept unless you choose to wipe)"
+            "Users  : [5] create / delete / view users")
+  module_menu mine-panel "MINE PANEL" install_mine_panel update_mine_panel reinstall_mine_panel module_panel_users
 }
 
 # ============================================================================
@@ -1243,6 +1555,29 @@ install_cloudflare() {
   return 0
 }
 
+reinstall_cloudflare() {
+  STAGE_TOTAL=8; STAGE_DONE=0; CF_TOKEN=""
+  if ! cf_installed && ! cf_service_exists; then
+    printf '  %s%s%s Cloudflare is not installed yet. Use [1] Install first.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sThis removes cloudflared and the tunnel service, then installs everything again.%s\n' "$DIM" "$RST"
+  printf '  %sYou need your Cloudflare tunnel token (asked first, before anything is removed).%s\n' "$DIM" "$RST"
+  ask_yn "Reinstall Cloudflare now?" || return 2
+  printf '\n'
+  stage    "Preflight: disk & network"   preflight "https://pkg.cloudflare.com/cloudflare-public-v2.gpg" || return 1
+  stage_fg "Tunnel token"                cf_ask_token   || { CF_TOKEN=""; return 1; }
+  stage    "Removing tunnel service"     cf_service_remove || { CF_TOKEN=""; return 1; }
+  stage    "Removing cloudflared"        cf_pkg_remove     || { CF_TOKEN=""; return 1; }
+  stage    "Cleaning repo and config"    cf_clean          || { CF_TOKEN=""; return 1; }
+  stage    "Installing cloudflared"      cf_install_pkg    || { CF_TOKEN=""; return 1; }
+  stage    "Connecting tunnel (service)" cf_service_install || { CF_TOKEN=""; return 1; }
+  CF_TOKEN=""
+  stage    "Verifying tunnel"            cf_verify || return 1
+  mark_installed cloudflare
+  cf_open_hint
+  return 0
+}
+
 cf_service_remove() {
   if cf_service_exists; then
     if cf_installed; then cloudflared service uninstall >>"$LOG_FILE" 2>&1 || true; fi
@@ -1312,6 +1647,7 @@ draw_cf_menu() {
   box_sep
   box_kv "[1]" "Install"   "Install cloudflared + connect with token"
   box_kv "[2]" "Uninstall" "Remove cloudflared and the tunnel"
+  box_kv "[3]" "Reinstall" "Remove everything and install again"
   box_kv "[B]" "Back"      "Back to Main Menu"
   box_bot
   [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
@@ -1319,20 +1655,21 @@ draw_cf_menu() {
 }
 
 module_cloudflare() {
-  MSG=""
+  MSG=""; local first=1
   while true; do
     REDRAW=draw_cf_menu
-    draw_cf_menu
+    if (( first )); then draw_anim draw_cf_menu; first=0; else draw_cf_menu; fi
     read_key || exit 0
     MSG=""
     case $KEY in
       1) run_cf_action "CLOUDFLARE - INSTALL"   install_cloudflare   "CLOUDFLARE INSTALLED & CONNECTED" ;;
       2) run_cf_action "CLOUDFLARE - UNINSTALL" uninstall_cloudflare "CLOUDFLARE UNINSTALLED" ;;
+      3) run_cf_action "CLOUDFLARE - REINSTALL" reinstall_cloudflare "CLOUDFLARE REINSTALLED & CONNECTED" ;;
       b|B) return 0 ;;
       0|q|Q) do_exit ;;
-      $'\e') drain_esc; MSG="Invalid input. Use 1, 2 or B." ;;
-      "") MSG="Please press 1, 2 or B." ;;
-      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Use 1, 2 or B." ;;
+      $'\e') drain_esc; MSG="Invalid input. Use 1, 2, 3 or B." ;;
+      "") MSG="Please press 1, 2, 3 or B." ;;
+      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Use 1, 2, 3 or B." ;;
     esac
   done
 }
@@ -1347,18 +1684,74 @@ screen_welcome() {
   cpu=$(nproc 2>/dev/null || echo "?")
   ram=$(awk '/MemTotal/{printf "%d MB", $2/1024}' /proc/meminfo 2>/dev/null)
   disk=$(df -Ph / | awk 'NR==2{print $4}')
-  box_center "Welcome to MineFlareX" "$P$BLD"
   box_blank
-  box_row "OS      : $os" "$WHT"
-  box_row "CPU     : $cpu core(s)    RAM: $ram    Free disk: $disk" "$WHT"
-  box_row "Log     : $LOG_FILE" "$DIM"
+  box_grad "WELCOME TO MINEFLAREX"
   box_blank
-  box_row "Fast  |  Secure  |  One-command setup" "$P"
+  box_info "System" "$os"
+  box_info "CPU" "$cpu core(s)"
+  box_info "Memory" "$ram"
+  box_info "Disk" "$disk free"
+  box_info "Virt" "${VIRT_LABEL:-none}"
+  box_info "Log" "$LOG_FILE"
+  box_blank
+  box_center "Fast  ·  Secure  ·  One-command setup" "$P"
   box_bot
-  printf '\n%*s%sPress any key to open the main menu...%s' "$PAD" '' "$DIM" "$RST"
+  printf '\n\n'
+  welcome_prompt 0
+}
+
+welcome_prompt() {   # frame  (pulses between dim and bright)
+  local t="Press any key to open the main menu" c
+  if (( $1 % 2 )); then c="$WHT$BLD"; else c="$DIM"; fi
+  printf '\r\e[K%*s%s%s%s' "$(( PAD + (W - ${#t}) / 2 ))" '' "$c" "$t" "$RST"
+}
+
+wait_key_pulse() {   # waits for a key while the prompt pulses; handles terminal resize
+  local i=0 k rc
+  while true; do
+    IFS= read -rsn1 -t 0.45 k </dev/tty; rc=$?
+    if (( rc == 0 )); then KEY=$k; return 0
+    elif (( rc > 128 )); then
+      if (( RESIZED )); then RESIZED=0; update_dims; screen_welcome; fi
+      i=$(( i + 1 )); welcome_prompt "$i"
+    else KEY=""; return 1; fi
+  done
+}
+
+mm_status() {  # label text state(1 ok / 2 warn / 0 off)
+  local lab dot c txt=$2
+  printf -v lab '%-14s' "$1"
+  case $3 in 1) c=$GRN; dot=$DOT ;; 2) c=$YEL; dot=$DOT ;; *) c=$DIM; dot=$DOT0 ;; esac
+  box_raw_l "${DIM}${lab}${RST}${c}${dot} ${txt}${RST}" $(( 14 + ${#dot} + 1 + ${#txt} ))
 }
 
 draw_main_menu() {
+  header_full
+  box_blank
+  box_grad "SELECT AN OPTION"
+  box_blank
+  local i1="" i2="" i3="" i0="" st
+  if (( UTF )); then i1="◆ "; i2="▣ "; i3="◉ "; i0="✕ "; fi
+  box_kv "[1]" "${i1}BVM VPS BOT"   "VPS automation bot"
+  box_kv "[2]" "${i2}MINE PANEL"    "Minecraft + Bot hosting panel"
+  box_kv "[3]" "${i3}CLOUDFLARE"    "Tunnel (install / reinstall / uninstall)"
+  box_blank
+  box_sep
+  if [ -d "$BOT_DIR/.git" ]; then mm_status "BVM VPS BOT" "installed" 1; else mm_status "BVM VPS BOT" "not installed" 0; fi
+  if panel_installed; then
+    if systemctl is-active --quiet minepanel 2>/dev/null; then mm_status "MINE PANEL" "running" 1; else mm_status "MINE PANEL" "installed - stopped" 2; fi
+  else mm_status "MINE PANEL" "not installed" 0; fi
+  st=$(cf_status)
+  case $st in *"not installed"*) mm_status "CLOUDFLARE" "not installed" 0 ;; *"tunnel running"*) mm_status "CLOUDFLARE" "tunnel running" 1 ;; *) mm_status "CLOUDFLARE" "$st" 2 ;; esac
+  box_sep
+  box_kv "[0]" "${i0}EXIT" ""
+  box_row "Just press the number - no Enter needed" "$DIM"
+  box_bot
+  [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
+  printf '\n%*s%sEnter choice [1-3, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
+}
+
+main_menu() {
   header_full
   box_center "$( (( UTF )) && printf "◈  SELECT AN INSTALLATION  ◈" || printf "SELECT AN INSTALLATION")" "$P$BLD"
   box_blank
@@ -1366,7 +1759,7 @@ draw_main_menu() {
   if (( UTF )); then i1="◆ "; i2="▣ "; i3="◉ "; i0="✕ "; fi
   box_kv "[1]" "${i1}BVM VPS BOT"   "VPS automation bot"
   box_kv "[2]" "${i2}MINE PANEL"    "Minecraft + Bot hosting panel"
-  box_kv "[3]" "${i3}CLOUDFLARE"    "Cloudflare tunnel (install / uninstall)"
+  box_kv "[3]" "${i3}CLOUDFLARE"    "Cloudflare tunnel (install / reinstall / uninstall)"
   box_blank
   box_kv "[0]" "${i0}EXIT" ""
   box_blank
@@ -1377,11 +1770,11 @@ draw_main_menu() {
 }
 
 main_menu() {
-  MSG=""
+  MSG=""; local first=1
   while true; do
     STAGE_TOTAL=0; STAGE_DONE=0
     REDRAW=draw_main_menu
-    draw_main_menu
+    if (( first )); then draw_anim draw_main_menu; first=0; else draw_main_menu; fi
     read_key || exit 0
     MSG=""
     case $KEY in
@@ -1419,8 +1812,8 @@ main() {
   detect_pm || true
   boot
   REDRAW=screen_welcome
-  screen_welcome
-  read_key || exit 0
+  BOX_DELAY=0.02; screen_welcome; BOX_DELAY=0
+  wait_key_pulse || exit 0
   main_menu
 }
 
