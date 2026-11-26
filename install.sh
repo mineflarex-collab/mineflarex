@@ -14,6 +14,8 @@ PANEL_HOME="${MFX_PANEL_HOME:-/opt/minepanel}"
 INSTALL_ROOT="/opt/mineflarex"
 PANEL_DIR="$INSTALL_ROOT/mineflarex-panel"
 BOT_DIR="$INSTALL_ROOT/Bvm-v1bot"
+BVMP_ZIP_URL="${MFX_BVMP_ZIP:-$BASE_URL/bvmpanel.zip}"   # BVM panel zip, hosted next to minepanel.zip (zip root must contain install.sh)
+BVMP_DIR="$INSTALL_ROOT/Bvm-panel"
 STATE_DIR="/var/lib/mineflarex"
 LOG_DIR="/var/log/mineflarex"
 
@@ -747,7 +749,7 @@ draw_module_menu() {
   box_kv "[2]" "View Log"       "Show recent log lines"
   [ -n "$CUR_UPD" ] && box_kv "[3]" "Update"     "Update to the latest version (data is kept)"
   [ -n "$CUR_REI" ] && box_kv "[4]" "Reinstall"  "Remove and install again from scratch"
-  [ -n "$CUR_USR" ] && box_kv "[5]" "Users"      "Create / delete / view panel users"
+  [ -n "$CUR_USR" ] && box_kv "[5]" "Users"      "Create / delete / view / reset password"
   box_kv "[B]" "Back"           "Back to Main Menu"
   box_kv "[0]" "Exit"           ""
   box_bot
@@ -940,6 +942,98 @@ module_bvm_bot() {
             "Reinst : [4] fresh copy (old folder is backed up)"
             "Needs  : root, git (auto-installed), internet")
   module_menu bvm-bot "BVM VPS BOT" install_bvm_bot update_bvm_bot reinstall_bvm_bot
+}
+
+# ============================================================================
+#  MODULE BVM PANEL  (zip download -> install.sh)
+# ============================================================================
+bvmp_installed() { [ -f "$BVMP_DIR/install.sh" ]; }
+bvmp_fetch_zip() {  # download bvmpanel.zip -> $BVMP_DIR (HTTPS only; files are overlaid, so config/data already there are kept)
+  [[ $BVMP_ZIP_URL == https://* ]] || { echo "Refusing non-HTTPS zip URL: $BVMP_ZIP_URL"; return 1; }
+  command -v unzip >/dev/null 2>&1 || { apt_update; apt-get install -y unzip >>"$LOG_FILE" 2>&1; }
+  command -v unzip >/dev/null 2>&1 || { echo "unzip could not be installed (see log)"; return 1; }
+  local tmp z src
+  tmp=$(mktemp -d) || return 1
+  z="$tmp/bvmpanel.zip"
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 180 -o "$z" "$BVMP_ZIP_URL" \
+    || { rm -rf "$tmp"; echo "Cannot download $BVMP_ZIP_URL"; return 1; }
+  unzip -tq "$z" >/dev/null 2>&1 || { rm -rf "$tmp"; echo "Downloaded file is not a valid zip (wrong link?)"; return 1; }
+  unzip -q "$z" -d "$tmp/x" || { rm -rf "$tmp"; echo "unzip failed"; return 1; }
+  src="$tmp/x"
+  if [ ! -f "$src/install.sh" ] && [ "$(find "$src" -mindepth 1 -maxdepth 1 | wc -l)" = 1 ]; then
+    src=$(find "$src" -mindepth 1 -maxdepth 1 -type d | head -n1)
+  fi
+  [ -f "$src/install.sh" ] || { rm -rf "$tmp"; echo "install.sh not found in the zip root"; return 1; }
+  mkdir -p "$BVMP_DIR" && cp -a "$src"/. "$BVMP_DIR"/ || { rm -rf "$tmp"; echo "copy failed"; return 1; }
+  rm -rf "$tmp"
+  echo "zip ok, $(find "$BVMP_DIR" -type f | wc -l) files"
+}
+run_bvmp_installer() {
+  local rc
+  ( cd "$BVMP_DIR" && chmod +x install.sh && env MFX_VIRT="$VIRT" MFX_LOG="$LOG_FILE" MFX_COLOR="$THEME_MODE" FORCE_COLOR=1 CLICOLOR_FORCE=1 ./install.sh </dev/tty )
+  rc=$?
+  return "$rc"
+}
+install_bvm_panel() {
+  STAGE_TOTAL=4; STAGE_DONE=0
+  if [ -e "$BVMP_DIR" ]; then
+    printf '  %s%s%s Existing copy found: %s\n' "$YEL" "$WRN" "$RST" "$BVMP_DIR"
+    ask_yn "Update it from the zip and re-run its install.sh? Existing files may change." || return 2
+  fi
+  printf '\n'
+  stage "Preflight: disk & network" preflight "$BVMP_ZIP_URL" || return 1
+  stage "Downloading BVM Panel (zip)" bvmp_fetch_zip || return 1
+  stage "Validating install.sh" validate_script "$BVMP_DIR/install.sh" || return 1
+  stage_fg "Running install.sh" run_bvmp_installer || return 1
+  mark_installed bvm-panel
+  return 0
+}
+update_bvm_panel() {
+  STAGE_TOTAL=4; STAGE_DONE=0
+  if ! bvmp_installed; then
+    printf '  %s%s%s BVM PANEL is not installed yet. Use [1] Start Install first.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sThe latest zip is downloaded; your panel data and config files are kept.%s\n\n' "$DIM" "$RST"
+  ask_yn "Update BVM PANEL now?" || return 2
+  printf '\n'
+  stage "Preflight: disk & network" preflight "$BVMP_ZIP_URL" || return 1
+  stage "Downloading latest BVM Panel (zip)" bvmp_fetch_zip || return 1
+  stage "Validating install.sh" validate_script "$BVMP_DIR/install.sh" || return 1
+  stage_fg "Running install.sh (apply update)" run_bvmp_installer || return 1
+  mark_installed bvm-panel
+  return 0
+}
+bvmp_remove_copy() {   # backup the old folder, then delete it
+  [ -d "$BVMP_DIR" ] || { echo "no old copy found"; return 0; }
+  local b="$STATE_DIR/bvm-panel-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  mkdir -p "$STATE_DIR" || return 1
+  tar -czf "$b" -C "$(dirname "$BVMP_DIR")" "$(basename "$BVMP_DIR")" 2>>"$LOG_FILE" || { echo "backup failed - nothing was deleted"; return 1; }
+  chmod 600 "$b"
+  rm -rf "${BVMP_DIR:?}" || return 1
+  echo "old copy removed, backup: $b"
+}
+reinstall_bvm_panel() {
+  STAGE_TOTAL=5; STAGE_DONE=0
+  printf '  %sThis deletes %s, downloads the zip fresh and runs its install.sh again.%s\n' "$DIM" "$BVMP_DIR" "$RST"
+  printf '  %sA backup of the old folder is saved in %s first.%s\n\n' "$DIM" "$STATE_DIR" "$RST"
+  ask_yn "Reinstall BVM PANEL now?" || return 2
+  printf '\n'
+  stage "Preflight: disk & network" preflight "$BVMP_ZIP_URL" || return 1
+  stage "Removing old copy (with backup)" bvmp_remove_copy || return 1
+  stage "Downloading BVM Panel (zip)" bvmp_fetch_zip || return 1
+  stage "Validating install.sh" validate_script "$BVMP_DIR/install.sh" || return 1
+  stage_fg "Running install.sh" run_bvmp_installer || return 1
+  mark_installed bvm-panel
+  return 0
+}
+module_bvm_panel() {
+  CUR_INFO=("BVM PANEL (web panel for the BVM VPS bot)"
+            "Source : $BVMP_ZIP_URL"
+            "Steps  : download zip, validate, run install.sh"
+            "Update : [3] downloads the latest zip and re-applies it"
+            "Reinst : [4] fresh copy (old folder is backed up)"
+            "Needs  : root, unzip (auto-installed), internet")
+  module_menu bvm-panel "BVM PANEL" install_bvm_panel update_bvm_panel reinstall_bvm_panel
 }
 
 # ============================================================================
@@ -1226,7 +1320,7 @@ mp_users_prepare() {   # writes the helper next to the database (data/ is never 
   panel_installed || { printf '  %s%s%s Mine Panel is not installed yet. Install it first.\n' "$YEL" "$WRN" "$RST"; return 1; }
   [ -f "$PANEL_HOME/data/minepanel.db" ] || { printf '  %s%s%s Panel database not found yet - start the panel once, then try again.\n' "$YEL" "$WRN" "$RST"; return 1; }
   cat >"$PANEL_HOME/data/.mfx-users.js" <<'MFXJS'
-// MineFlareX user helper - list / setrole / delete (schema is auto-detected)
+// MineFlareX user helper - list / setrole / delete / copypass (schema is auto-detected)
 const { DatabaseSync } = require('node:sqlite');
 const [cmd, a1, a2] = process.argv.slice(2);
 const db = new DatabaseSync(process.env.MFX_DB);
@@ -1275,6 +1369,42 @@ if (cmd === 'list') {
   try { db.prepare(`DELETE FROM "${ut}" WHERE "${cId}" = ?`).run(id); }
   catch (e) { die('Could not delete: this user still owns data (servers/bots). Delete those in the panel first. (' + e.message + ')', 7); }
   console.log('deleted ' + a1);
+} else if (cmd === 'copypass') {                 // copy the password hash of temp user a1 onto user a2, then remove temp user a1
+  const src = find(a1), dst = find(a2);
+  if (!src) die('Temporary user not found', 4);
+  if (!dst) die('No user with that email', 4);
+  const pc = cols.filter(c => /pass|hash|salt/i.test(c) && ![cId, cEmail, cUser].includes(c) && !/(reset|token|expir|_at$|must|force|require)/i.test(c));
+  if (!pc.length) die('password column not found in table ' + ut + ' (columns: ' + cols.join(', ') + ')', 6);
+  db.prepare(`UPDATE "${ut}" SET ${pc.map(c => `"${c}" = ?`).join(', ')} WHERE "${cId}" = ?`).run(...pc.map(c => src[c]), dst[cId]);
+  const clean = id => {                            // login sessions / tokens: old password must stop working everywhere
+    for (const t of tables) {
+      if (t === ut || !/session|token|reset|remember|login/i.test(t)) continue;
+      const c = colsOf(t).find(x => /^(user_?id|userid|user)$/i.test(x));
+      if (c) { try { db.prepare(`DELETE FROM "${t}" WHERE "${c}" = ?`).run(id); } catch (e) {} }
+    }
+  };
+  clean(dst[cId]); clean(src[cId]);
+  const done = [];
+  for (const c of cols) {                          // lockout counters / lock times on the user row (15-min login limit)
+    if (!/(fail|attempt|lock|block|throttl)/i.test(c) || [cId, cEmail, cUser, cRole].includes(c)) continue;
+    const isTime = /(_at$|until|expir|time|date)/i.test(c);
+    for (const v of (isTime ? [null, 0] : [0, null])) {
+      try { db.prepare(`UPDATE "${ut}" SET "${c}" = ? WHERE "${cId}" = ?`).run(v, dst[cId]); done.push(c); break; } catch (e) {}
+    }
+  }
+  for (const t of tables) {                        // separate login-attempt / rate-limit tables
+    if (t === ut || !/(attempt|throttl|rate.?limit|lockout|login_fail|failed)/i.test(t)) continue;
+    for (const c of colsOf(t)) {
+      if (!/^(user_?id|userid|user|email|identifier|username|key|account)$/i.test(c)) continue;
+      const em = String(dst[cEmail]).toLowerCase();
+      for (const [w, a] of [[`"${c}" = ?`, dst[cId]], [`lower(CAST("${c}" AS TEXT)) = ?`, em], [`lower(CAST("${c}" AS TEXT)) LIKE ?`, '%' + em + '%']]) {
+        try { db.prepare(`DELETE FROM "${t}" WHERE ${w}`).run(a); done.push(t); } catch (e) {}
+      }
+    }
+  }
+  try { db.prepare(`DELETE FROM "${ut}" WHERE "${cId}" = ?`).run(src[cId]); }
+  catch (e) { die('Password changed, but the temporary helper user could not be removed (' + a1 + '): ' + e.message, 7); }
+  console.log('password updated for ' + a2 + (done.length ? ' | login limit cleared: ' + [...new Set(done)].join(', ') : ''));
 } else die('unknown command', 2);
 MFXJS
   chown minepanel:minepanel "$PANEL_HOME/data/.mfx-users.js" 2>/dev/null
@@ -1352,6 +1482,62 @@ mp_user_delete() {
   printf '  %s%s%s\n' "$RED" "$(printf '%s' "$out" | tail -n1)" "$RST"; return 1
 }
 
+mp_user_resetpw() {
+  mp_users_prepare || return 1
+  [ -r /dev/tty ] || { echo "no terminal available"; return 1; }
+  local email pw pw2 tuser tmail out id un em ro n=0 sel
+  local -a EM=() RO=()
+  out=$(mp_users_run list) || { printf '  %s%s%s\n' "$RED" "$(printf '%s' "$out" | tail -n1)" "$RST"; return 1; }
+  printf '  %sSelect the user:%s\n\n' "$P$BLD" "$RST"
+  while IFS=$'\t' read -r id un em ro; do
+    [ -n "$em" ] || continue
+    n=$((n + 1)); EM[$n]=$em; RO[$n]=$ro
+    printf '  %s%2d%s  %s  %s(%s)%s\n' "$WHT$BLD" "$n" "$RST" "$em" "$DIM" "$ro" "$RST"
+  done <<<"$out"
+  (( n )) || { printf '  %sNo users yet.%s\n' "$DIM" "$RST"; return 1; }
+  while true; do
+    printf '\n  %sEnter number 1-%d (empty = cancel):%s ' "$WHT" "$n" "$RST" >/dev/tty; IFS= read -r sel </dev/tty
+    sel=$(printf '%s' "$sel" | tr -d '[:space:]')
+    [ -n "$sel" ] || { printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST"; return 2; }
+    [[ $sel =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= n )) && break
+    printf '  %sInvalid number.%s\n' "$YEL" "$RST"
+  done
+  email=${EM[$sel]}
+  printf '\n  %sSelected: %s%s\n\n' "$DIM" "$email" "$RST"
+  while true; do
+    printf '  %sNew password (10+ characters, letters + numbers, empty = cancel):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -rs pw </dev/tty; printf '\n' >/dev/tty
+    [ -n "$pw" ] || { printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST"; return 2; }
+    if (( ${#pw} < 10 )) || [[ ! $pw =~ [A-Za-z] ]] || [[ ! $pw =~ [0-9] ]]; then
+      printf '  %sPassword must be 10+ characters and contain both letters and numbers. Try again.%s\n\n' "$YEL" "$RST"; continue
+    fi
+    printf '  %sConfirm new password:%s ' "$WHT" "$RST" >/dev/tty; IFS= read -rs pw2 </dev/tty; printf '\n' >/dev/tty
+    [ "$pw" = "$pw2" ] || { printf '  %sThe two passwords do not match. Try again.%s\n\n' "$YEL" "$RST"; continue; }
+    break
+  done
+  ask_yn "Reset password for $email? (y/n)" || { printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST"; return 2; }
+  # The panel's own create-admin.js hashes the password (so the hash format always matches the panel);
+  # that hash is copied to the real user and the temporary helper user is removed again.
+  tuser="mfxr${RANDOM}${RANDOM}"; tmail="${tuser}@example.com"
+  if ! out=$( cd "$PANEL_HOME" && runuser -u minepanel -- env ADMIN_PASSWORD="$pw" node $PANEL_NODE_FLAGS scripts/create-admin.js "$tmail" "$tuser" 2>&1 ); then
+    printf '  %s%s%s\n' "$RED" "$(printf '%s' "$out" | tail -n1)" "$RST"; return 1
+  fi
+  if out=$(mp_users_run copypass "$tmail" "$email"); then
+    printf '  %s%s%s Password reset for: %s\n' "$GRN" "$OK" "$RST" "$email"
+    printf '  %s%s%s\n' "$DIM" "$(printf '%s' "$out" | tail -n1)" "$RST"
+    printf '  %sThe user was logged out everywhere and the 15-minute login limit was cleared.%s\n' "$DIM" "$RST"
+    if systemctl is-active --quiet minepanel 2>/dev/null; then
+      printf '\n  %sIf the panel still shows "too many attempts", the limit lives in the panel memory.%s\n' "$DIM" "$RST"
+      if ask_yn "Restart the panel now to clear it? (data is kept; running servers may stop briefly)"; then
+        systemctl restart minepanel && printf '  %s%s%s Panel restarted.\n' "$GRN" "$OK" "$RST" \
+          || printf '  %s%s%s Could not restart the panel.\n' "$YEL" "$WRN" "$RST"
+      fi
+    fi
+    return 0
+  fi
+  mp_users_run delete "$tmail" >/dev/null 2>&1   # never leave the temporary user behind
+  printf '  %s%s%s\n' "$RED" "$(printf '%s' "$out" | tail -n1)" "$RST"; return 1
+}
+
 run_user_action() {  # title fn
   REDRAW=""
   header_small "$1"
@@ -1368,7 +1554,8 @@ draw_users_menu() {
   box_kv "[1]" "Create" "New user (admin yes/no, gmail, password)"
   box_kv "[2]" "Delete" "Delete a user by email"
   box_kv "[3]" "View"   "List all users"
-  box_kv "[B]" "Back"   "Back to Mine Panel menu"
+  box_kv "[4]" "Reset Password" "Set a new password for a user"
+  box_kv "[0]" "Back"   "Back to Mine Panel menu"
   box_bot
   [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
   printf '\n%*s%sSelect option:%s ' "$PAD" '' "$P$BLD" "$RST"
@@ -1385,11 +1572,12 @@ module_panel_users() {
       1) run_user_action "USERS - CREATE" mp_user_create ;;
       2) run_user_action "USERS - DELETE" mp_user_delete ;;
       3) run_user_action "USERS - VIEW"   mp_user_view ;;
-      b|B) return 0 ;;
-      0|q|Q) do_exit ;;
-      $'\e') drain_esc; MSG="Invalid input. Use 1, 2, 3 or B." ;;
-      "") MSG="Please press 1, 2, 3 or B." ;;
-      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Use 1, 2, 3 or B." ;;
+      4) run_user_action "USERS - RESET PASSWORD" mp_user_resetpw ;;
+      0|b|B) return 0 ;;
+      q|Q) do_exit ;;
+      $'\e') drain_esc; MSG="Invalid input. Use 1, 2, 3, 4 or 0." ;;
+      "") MSG="Please press 1, 2, 3, 4 or 0." ;;
+      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Use 1, 2, 3, 4 or 0." ;;
     esac
   done
 }
@@ -1401,7 +1589,7 @@ module_mine_panel() {
             "Last   : asks the admin email + password"
             "Update : menu [3] keeps all your data"
             "Reinst : [4] fresh install (data kept unless you choose to wipe)"
-            "Users  : [5] create / delete / view users")
+            "Users  : [5] create / delete / view / reset password")
   module_menu mine-panel "MINE PANEL" install_mine_panel update_mine_panel reinstall_mine_panel module_panel_users
 }
 
@@ -1745,17 +1933,19 @@ draw_main_menu() {
   box_blank
   box_grad "SELECT AN OPTION"
   box_blank
-  local i1="" i2="" i3="" i0="" st
-  if (( UTF )); then i1="◆ "; i2="▣ "; i3="◉ "; i0="✕ "; fi
+  local i1="" i2="" i3="" i4="" i0="" st
+  if (( UTF )); then i1="◆ "; i2="▣ "; i3="❖ "; i4="◉ "; i0="✕ "; fi
   box_kv "[1]" "${i1}BVM VPS BOT"   "VPS automation bot"
   box_kv "[2]" "${i2}MINE PANEL"    "Minecraft + Bot hosting panel"
-  box_kv "[3]" "${i3}CLOUDFLARE"    "Tunnel (install / reinstall / uninstall)"
+  box_kv "[3]" "${i3}BVM PANEL"     "Web panel for the BVM bot"
+  box_kv "[4]" "${i4}CLOUDFLARE"    "Tunnel (install / reinstall / uninstall)"
   box_blank
   box_sep
   if [ -d "$BOT_DIR/.git" ]; then mm_status "BVM VPS BOT" "installed" 1; else mm_status "BVM VPS BOT" "not installed" 0; fi
   if panel_installed; then
     if systemctl is-active --quiet minepanel 2>/dev/null; then mm_status "MINE PANEL" "running" 1; else mm_status "MINE PANEL" "installed - stopped" 2; fi
   else mm_status "MINE PANEL" "not installed" 0; fi
+  if bvmp_installed; then mm_status "BVM PANEL" "installed" 1; else mm_status "BVM PANEL" "not installed" 0; fi
   st=$(cf_status)
   case $st in *"not installed"*) mm_status "CLOUDFLARE" "not installed" 0 ;; *"tunnel running"*) mm_status "CLOUDFLARE" "tunnel running" 1 ;; *) mm_status "CLOUDFLARE" "$st" 2 ;; esac
   box_sep
@@ -1763,25 +1953,26 @@ draw_main_menu() {
   box_row "Just press the number - no Enter needed" "$DIM"
   box_bot
   [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
-  printf '\n%*s%sEnter choice [1-3, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
+  printf '\n%*s%sEnter choice [1-4, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
 }
 
 main_menu() {
   header_full
   box_center "$( (( UTF )) && printf "◈  SELECT AN INSTALLATION  ◈" || printf "SELECT AN INSTALLATION")" "$P$BLD"
   box_blank
-  local i1="" i2="" i3="" i0=""
-  if (( UTF )); then i1="◆ "; i2="▣ "; i3="◉ "; i0="✕ "; fi
+  local i1="" i2="" i3="" i4="" i0=""
+  if (( UTF )); then i1="◆ "; i2="▣ "; i3="❖ "; i4="◉ "; i0="✕ "; fi
   box_kv "[1]" "${i1}BVM VPS BOT"   "VPS automation bot"
   box_kv "[2]" "${i2}MINE PANEL"    "Minecraft + Bot hosting panel"
-  box_kv "[3]" "${i3}CLOUDFLARE"    "Cloudflare tunnel (install / reinstall / uninstall)"
+  box_kv "[3]" "${i3}BVM PANEL"     "Web panel for the BVM bot"
+  box_kv "[4]" "${i4}CLOUDFLARE"    "Cloudflare tunnel (install / reinstall / uninstall)"
   box_blank
   box_kv "[0]" "${i0}EXIT" ""
   box_blank
   box_row "Just press the number - no Enter needed" "$DIM"
   box_bot
   [ -n "$MSG" ] && printf '\n%*s%s%s%s\n' "$PAD" '' "$RED" "$MSG" "$RST"
-  printf '\n%*s%sEnter choice [1-3, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
+  printf '\n%*s%sEnter choice [1-4, 0=Exit]:%s ' "$PAD" '' "$P$BLD" "$RST"
 }
 
 main_menu() {
@@ -1795,11 +1986,12 @@ main_menu() {
     case $KEY in
       1) module_bvm_bot ;;
       2) module_mine_panel ;;
-      3) module_cloudflare ;;
+      3) module_bvm_panel ;;
+      4) module_cloudflare ;;
       0|q|Q) do_exit ;;
-      $'\e') drain_esc; MSG="Invalid input. Please press 1, 2, 3 or 0." ;;
-      "") MSG="Please press 1, 2, 3 or 0." ;;
-      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Please press 1, 2, 3 or 0." ;;
+      $'\e') drain_esc; MSG="Invalid input. Please press 1, 2, 3, 4 or 0." ;;
+      "") MSG="Please press 1, 2, 3, 4 or 0." ;;
+      *) MSG="Invalid option '${KEY//[^[:print:]]/?}'. Please press 1, 2, 3, 4 or 0." ;;
     esac
   done
 }
