@@ -5,7 +5,7 @@
 # ============================================================================
 set -uo pipefail
 
-MFX_VERSION="1.1.0"
+MFX_VERSION="1.2.0"
 BASE_URL="${MFX_BASE_URL:-https://mineflarex.indevs.in}"
 BOT_REPO="${MFX_BOT_REPO:-https://github.com/mineflarex-collab/Bvm-v1bot.git}"
 PANEL_ZIP_URL="${MFX_PANEL_ZIP:-$BASE_URL/minepanel.zip}"   # panel is installed from this single zip (no GitHub folders needed)
@@ -44,6 +44,9 @@ CUR_KEY=""; CUR_TITLE=""; CUR_FN=""; CUR_UPD=""; CUR_REI=""; CUR_USR=""; CUR_INF
 PANEL_WIPE=0
 BOX_DELAY=0
 BDG=""
+IN_OP=0; ABORT=0; SPIN_PID=""; ROLLBACK_FN=""; ABORT_MSG=""
+CUR_UNI=""; UNI_BACKUPS=0
+RB_DIR=""; RB_BACKUP=""; RB_HOME_PRE=0; RB_USER_PRE=0; RB_TMAIL=""
 
 # ----------------------------------------------------------------------------
 #  Core helpers: logging, locale, theme, screen
@@ -51,6 +54,7 @@ BDG=""
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
 
 cleanup() {
+  [ -n "${SPIN_PID:-}" ] && kill_tree "$SPIN_PID" KILL
   leave_fullscreen 2>/dev/null
   printf '\e[?25h\e[0m' 2>/dev/null
   [ -n "${TMP:-}" ] && rm -rf "$TMP"
@@ -312,6 +316,7 @@ header_small() {
 read_key() {
   local k rc
   while true; do
+    if (( ABORT )); then KEY=n; return 0; fi     # Ctrl+C during an operation: any question is answered "no"
     IFS= read -rsn1 -t 0.3 k </dev/tty; rc=$?
     if (( rc == 0 )); then KEY=$k; return 0
     elif (( rc > 128 )); then
@@ -345,14 +350,21 @@ bar() {   # pct [width]  - purple gradient fill
 
 spin_run() {   # label cmd...   (cmd runs in background; stdout captured in SPIN_OUT)
   local label=$1; shift
-  local outf pid i=0 pct t0=$SECONDS el
+  local outf pid i=0 pct t0=$SECONDS el ticks=0
   outf=$(mktemp "$TMP/out.XXXXXX")
   printf '\e[?25l'
   "$@" >"$outf" 2>>"$LOG_FILE" &
-  pid=$!
+  pid=$!; SPIN_PID=$pid
   while kill -0 "$pid" 2>/dev/null; do
+    if (( ABORT )); then      # Ctrl+C: stop the background job (TERM first, KILL after ~3 s)
+      ticks=$((ticks + 1))
+      (( ticks == 1 )) && kill_tree "$pid" TERM
+      (( ticks == 30 )) && kill_tree "$pid" KILL
+    fi
     if (( STAGE_TOTAL > 0 )); then
-      pct=$(( STAGE_DONE * 100 / STAGE_TOTAL ))
+      # live percent: starts at the finished-stages value and creeps toward the next stage's value while this stage runs
+      local lo=$(( STAGE_DONE * 100 / STAGE_TOTAL )) hi=$(( (STAGE_DONE + 1) * 100 / STAGE_TOTAL ))
+      pct=$(( lo + (hi - lo) * (900 * i / (i + 100)) / 1000 ))
       printf '\r\e[K  %s%s%s %s  [%s] %s%3d%%%s' "$P" "${SPIN[i % ${#SPIN[@]}]}" "$RST" "$label" "$(bar "$pct")" "$WHT" "$pct" "$RST"
     else
       printf '\r\e[K  %s%s%s %s' "$P" "${SPIN[i % ${#SPIN[@]}]}" "$RST" "$label"
@@ -361,6 +373,7 @@ spin_run() {   # label cmd...   (cmd runs in background; stdout captured in SPIN
     i=$((i + 1)); sleep 0.1
   done
   wait "$pid"; SPIN_RC=$?
+  SPIN_PID=""
   SPIN_OUT=$(<"$outf"); rm -f "$outf"
   printf '\r\e[K\e[?25h'
   return "$SPIN_RC"
@@ -396,8 +409,10 @@ show_error() {  # label rc
 
 stage() {      # label cmd...  (background, logged, real progress)
   local label=$1; shift
+  (( ABORT )) && return 130
   log "STAGE $((STAGE_DONE + 1))/$STAGE_TOTAL: $label"
   spin_run "$label" "$@"; local rc=$?
+  if (( rc != 0 && ABORT )); then printf '  %s%s%s %s - interrupted\n' "$YEL" "$WRN" "$RST" "$label"; return 130; fi
   if (( rc == 0 )); then
     STAGE_DONE=$((STAGE_DONE + 1))
     local pct=$(( STAGE_DONE * 100 / STAGE_TOTAL ))
@@ -412,10 +427,12 @@ stage() {      # label cmd...  (background, logged, real progress)
 
 stage_fg() {   # label cmd...  (interactive, runs in foreground on the tty)
   local label=$1; shift
+  (( ABORT )) && return 130
   log "STAGE(fg) $((STAGE_DONE + 1))/$STAGE_TOTAL: $label"
   printf '  %s%s%s %s %s(interactive - live output below)%s\n\n' "$P" "$ARW" "$RST" "$label" "$DIM" "$RST"
   "$@"; local rc=$?
   printf '\n'
+  (( rc != 0 && ABORT )) && return 130
   if (( rc == 0 )); then
     STAGE_DONE=$((STAGE_DONE + 1))
     printf '  %s%s%s %-34s [%s] %s100%%%s\n' "$GRN" "$OK" "$RST" "$label" "$(bar 100)" "$WHT" "$RST"
@@ -424,6 +441,61 @@ stage_fg() {   # label cmd...  (interactive, runs in foreground on the tty)
   SPIN_OUT="Module exited with code $rc"
   show_error "$label" "$rc"
   return 1
+}
+
+# ----------------------------------------------------------------------------
+#  Ctrl+C handling: inside an install / update / uninstall, Ctrl+C cancels THAT operation
+#  (background jobs are killed, half-done work is rolled back) instead of killing the installer.
+# ----------------------------------------------------------------------------
+children_of() { pgrep -P "$1" 2>/dev/null || ps -o pid= --ppid "$1" 2>/dev/null; }
+kill_tree() {   # pid [signal]  - the process and everything it started
+  local p=$1 s=${2:-TERM} c
+  for c in $(children_of "$p"); do kill_tree "$c" "$s"; done
+  kill -"$s" "$p" 2>/dev/null
+  return 0
+}
+
+on_int() {
+  if (( IN_OP )); then
+    ABORT=1
+    [ -n "${SPIN_PID:-}" ] && kill_tree "$SPIN_PID" TERM
+    return 0
+  fi
+  exit 130
+}
+
+op_rollback() {   # runs after a Ctrl+C: kills what is left, undoes half-done work, repairs apt, restores the terminal
+  trap '' INT                      # a second Ctrl+C must not interrupt the clean-up
+  ABORT=0; STAGE_TOTAL=0
+  [ -n "${SPIN_PID:-}" ] && { kill_tree "$SPIN_PID" KILL; SPIN_PID=""; }
+  printf '\e[?25h'
+  { stty sane </dev/tty; } 2>/dev/null
+  printf '\n\n  %s%s Ctrl+C - cancelling...%s\n' "$YEL" "$WRN" "$RST"
+  local msg=$ABORT_MSG first
+  if [ -n "${ROLLBACK_FN:-}" ]; then
+    log "Ctrl+C: rollback via $ROLLBACK_FN"
+    spin_run "Rolling back changes" "$ROLLBACK_FN"
+    first=${SPIN_OUT%%$'\n'*}
+    printf '  %s%s%s Half-done changes rolled back\n' "$GRN" "$OK" "$RST"
+    [ -n "$first" ] && printf '    %s%s%s\n' "$DIM" "${first:0:$((COLS - 8))}" "$RST"
+    [ -n "$msg" ] || msg="Cancelled with Ctrl+C - nothing is left half-installed."
+  fi
+  if [ "$PM" = apt ]; then   # a killed apt/dpkg can leave packages half-configured and block the next install
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
+  fi
+  printf '  %s%s %s%s\n' "$YEL" "$WRN" "${msg:-Cancelled with Ctrl+C.}" "$RST"
+  trap on_int INT
+}
+
+op_call() {   # fn  - runs fn as a cancellable operation. Returns fn's code, or 130 after Ctrl+C (already cleaned up)
+  local rc
+  ROLLBACK_FN=""; ABORT_MSG=""; ABORT=0; SPIN_PID=""; IN_OP=1
+  "$1"; rc=$?
+  IN_OP=0
+  (( ABORT && rc != 0 )) && rc=130
+  (( rc == 130 )) && op_rollback
+  ABORT=0
+  return "$rc"
 }
 
 # ----------------------------------------------------------------------------
@@ -738,6 +810,96 @@ run_bot_installer() {
 }
 
 # ----------------------------------------------------------------------------
+#  Removal helpers (used by every Uninstall and by the Ctrl+C rollbacks)
+# ----------------------------------------------------------------------------
+app_stop_units() {   # dir : stop + delete every systemd service that points into dir
+  local dir=$1 f u n=0
+  for f in /etc/systemd/system/*.service; do
+    [ -f "$f" ] || continue
+    grep -qF -- "$dir" "$f" 2>/dev/null || continue
+    u=$(basename "$f")
+    systemctl stop "$u" >>"$LOG_FILE" 2>&1 || true
+    systemctl disable "$u" >>"$LOG_FILE" 2>&1 || true
+    rm -f "$f"; n=$((n + 1)); log "removed unit $u"
+  done
+  (( n )) && systemctl daemon-reload >>"$LOG_FILE" 2>&1
+  return 0
+}
+
+app_clean_cron() {   # dir : drop cron lines that mention dir
+  command -v crontab >/dev/null 2>&1 || return 0
+  crontab -l 2>/dev/null | grep -qF -- "$1" || return 0
+  crontab -l 2>/dev/null | grep -vF -- "$1" | crontab - >>"$LOG_FILE" 2>&1 || true
+}
+
+app_kill_procs() {   # dir : stop every process that runs from dir (cwd inside it, or dir in its command line)
+  local dir=$1 sig p pid c a q anc=" $$ ${BASHPID:-0} " hit
+  q=$$
+  while [ "${q:-0}" -gt 1 ]; do      # never touch ourselves or the shell that started us
+    q=$(awk '/^PPid:/{print $2}' "/proc/$q/status" 2>/dev/null); [ -n "$q" ] || break
+    anc+="$q "
+  done
+  for sig in TERM KILL; do
+    hit=0
+    for p in /proc/[0-9]*; do
+      pid=${p#/proc/}
+      case $anc in *" $pid "*) continue ;; esac
+      c=$(readlink "$p/cwd" 2>/dev/null); a=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
+      if [[ $c == "$dir" || $c == "$dir"/* || $a == *"$dir"* ]]; then kill -"$sig" "$pid" 2>/dev/null && hit=1; fi
+    done
+    (( hit )) || break
+    [ "$sig" = TERM ] && sleep 2
+  done
+  return 0
+}
+
+app_stop() { app_stop_units "$1"; app_clean_cron "$1"; app_kill_procs "$1"; echo "services, cron jobs and processes stopped"; }
+
+app_remove_dir() {   # dir : delete it completely (with a safety guard against dangerous paths)
+  local d=${1%/}
+  cd / 2>/dev/null
+  case $d in ""|/|/opt|/usr|/usr/local|/var|/var/lib|/etc|/home|/root|/srv|/mnt|/tmp|/bin|/sbin|/lib|/boot) echo "refusing to delete '$d'"; return 1 ;; esac
+  [[ $d =~ ^/[^/]+/[^/]+ ]] || { echo "refusing to delete '$d'"; return 1; }
+  [ -e "$d" ] || { echo "$d already gone"; return 0; }
+  rm -rf -- "$d"
+  [ -e "$d" ] && { echo "could not delete $d"; return 1; }
+  echo "deleted $d"
+}
+
+uni_leftovers() {   # key : state marker, optional old backups, empty install root
+  rm -f "$STATE_DIR/$1.installed"
+  (( UNI_BACKUPS )) && rm -f "$STATE_DIR/$1"-backup-*.tar.gz
+  [ "$1" = mine-panel ] && rm -f "$STATE_DIR/panel-last-backup"
+  rmdir "$INSTALL_ROOT" 2>/dev/null
+  echo "leftovers cleaned"
+  return 0
+}
+
+# --- rollbacks (set as ROLLBACK_FN by an operation; they run after Ctrl+C) ---
+rb_fresh_bot()  { app_stop "$BOT_DIR";  app_remove_dir "$BOT_DIR";  rm -f "$STATE_DIR/bvm-bot.installed";   rmdir "$INSTALL_ROOT" 2>/dev/null; return 0; }
+rb_fresh_bvmp() { app_stop "$BVMP_DIR"; app_remove_dir "$BVMP_DIR"; rm -f "$STATE_DIR/bvm-panel.installed"; rmdir "$INSTALL_ROOT" 2>/dev/null; return 0; }
+
+rb_restore_backup() {   # reinstall was cancelled: put the old folder (RB_DIR) back from its backup (RB_BACKUP)
+  [ -n "$RB_BACKUP" ] && [ -n "$RB_DIR" ] || return 0
+  if [ -f "$RB_BACKUP" ] && tar -tzf "$RB_BACKUP" >/dev/null 2>&1; then
+    app_kill_procs "$RB_DIR"
+    rm -rf "${RB_DIR:?}"
+    tar -xzf "$RB_BACKUP" -C "$(dirname "$RB_DIR")" || { echo "restore failed - backup kept: $RB_BACKUP"; return 1; }
+    rm -f "$RB_BACKUP"
+    echo "old copy restored"
+  else
+    rm -f "$RB_BACKUP"; echo "old copy was not touched"
+  fi
+}
+
+rb_tmp_user() {   # a user that was only half-created/changed must not stay behind (it could be an admin)
+  [ -n "$RB_TMAIL" ] || return 0
+  panel_installed && mp_users_run delete "$RB_TMAIL" >/dev/null 2>&1
+  echo "temporary account removed"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
 #  Generic module menu engine
 # ----------------------------------------------------------------------------
 draw_module_menu() {
@@ -750,6 +912,7 @@ draw_module_menu() {
   [ -n "$CUR_UPD" ] && box_kv "[3]" "Update"     "Update to the latest version (data is kept)"
   [ -n "$CUR_REI" ] && box_kv "[4]" "Reinstall"  "Remove and install again from scratch"
   [ -n "$CUR_USR" ] && box_kv "[5]" "Users"      "Create / delete / view / reset password"
+  [ -n "$CUR_UNI" ] && box_kv "[6]" "Uninstall"  "Remove everything (cannot be undone)"
   box_kv "[B]" "Back"           "Back to Main Menu"
   box_kv "[0]" "Exit"           ""
   box_bot
@@ -783,23 +946,41 @@ celebrate() {   # short sparkle burst on success
   printf '\r\e[K\e[?25h'
 }
 
-run_install() {
+run_op() {   # kind(install|update|reinstall|uninstall) fn
+  local kind=$1 fn=$2 hdr rc what
   REDRAW=""
-  header_small "$CUR_TITLE - INSTALLING"
+  case $kind in install) hdr=INSTALLING ;; update) hdr=UPDATE ;; reinstall) hdr=REINSTALL ;; *) hdr=UNINSTALL ;; esac
+  header_small "$CUR_TITLE - $hdr"
   box_row "Log: $LOG_FILE" "$DIM"
   box_bot
-  log "=== BEGIN $CUR_KEY ==="
-  "$CUR_FN"; local rc=$?
-  log "=== END $CUR_KEY rc=$rc ==="
+  log "=== BEGIN $CUR_KEY $kind ==="
+  op_call "$fn"; rc=$?
+  log "=== END $CUR_KEY $kind rc=$rc ==="
   printf '\n'
   case $rc in
-    0) celebrate; box_top; box_center "$( (( UTF )) && printf "★ INSTALLATION COMPLETE ★" || printf "INSTALLATION COMPLETE")" "$GRN$BLD"; box_center "$CUR_TITLE installed successfully" "$WHT"
+    0) case $kind in
+         install)   celebrate; box_top; box_center "$( (( UTF )) && printf "★ INSTALLATION COMPLETE ★" || printf "INSTALLATION COMPLETE")" "$GRN$BLD"; box_center "$CUR_TITLE installed successfully" "$WHT" ;;
+         update)    box_top; box_center "UPDATE COMPLETE" "$GRN$BLD"; box_center "$CUR_TITLE is up to date. Your data was kept." "$WHT" ;;
+         reinstall) celebrate; box_top; box_center "REINSTALL COMPLETE" "$GRN$BLD"; box_center "$CUR_TITLE was reinstalled successfully" "$WHT" ;;
+         *)         box_top; box_center "UNINSTALL COMPLETE" "$GRN$BLD"; box_center "$CUR_TITLE was removed completely" "$WHT" ;;
+       esac
        box_row "Log: $LOG_FILE" "$DIM"; box_bot ;;
     2) printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST" ;;
-    *) printf '  %s%sINSTALLATION FAILED%s - see details above.\n  Log: %s\n' "$RED" "$BLD" "$RST" "$LOG_FILE" ;;
+    130) ;;   # Ctrl+C: op_call already cleaned up and explained what happened
+    *) case $kind in
+         install)   what="INSTALLATION FAILED - see details above." ;;
+         update)    what="UPDATE FAILED - see details above. Your data is untouched." ;;
+         reinstall) what="REINSTALL FAILED - see details above." ;;
+         *)         what="UNINSTALL FAILED - see details above. Run Uninstall again to finish." ;;
+       esac
+       printf '  %s%s%s\n  Log: %s\n' "$RED" "$what" "$RST" "$LOG_FILE" ;;
   esac
   press_any_key
 }
+run_install()   { run_op install   "$CUR_FN"; }
+run_update()    { run_op update    "$CUR_UPD"; }
+run_reinstall() { run_op reinstall "$CUR_REI"; }
+run_uninstall() { run_op uninstall "$CUR_UNI"; }
 
 view_log() {
   REDRAW=""
@@ -816,44 +997,10 @@ do_exit() {
   exit 0
 }
 
-run_update() {
-  REDRAW=""
-  header_small "$CUR_TITLE - UPDATE"
-  box_row "Log: $LOG_FILE" "$DIM"
-  box_bot
-  log "=== BEGIN $CUR_KEY update ==="
-  "$CUR_UPD"; local rc=$?
-  log "=== END $CUR_KEY update rc=$rc ==="
-  printf '\n'
-  case $rc in
-    0) box_top; box_center "UPDATE COMPLETE" "$GRN$BLD"; box_center "$CUR_TITLE is up to date. Your data was kept." "$WHT"
-       box_row "Log: $LOG_FILE" "$DIM"; box_bot ;;
-    2) printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST" ;;
-    *) printf '  %s%sUPDATE FAILED%s - see details above. Your data is untouched.\n  Log: %s\n' "$RED" "$BLD" "$RST" "$LOG_FILE" ;;
-  esac
-  press_any_key
-}
 
-run_reinstall() {
-  REDRAW=""
-  header_small "$CUR_TITLE - REINSTALL"
-  box_row "Log: $LOG_FILE" "$DIM"
-  box_bot
-  log "=== BEGIN $CUR_KEY reinstall ==="
-  "$CUR_REI"; local rc=$?
-  log "=== END $CUR_KEY reinstall rc=$rc ==="
-  printf '\n'
-  case $rc in
-    0) celebrate; box_top; box_center "REINSTALL COMPLETE" "$GRN$BLD"; box_center "$CUR_TITLE was reinstalled successfully" "$WHT"
-       box_row "Log: $LOG_FILE" "$DIM"; box_bot ;;
-    2) printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST" ;;
-    *) printf '  %s%sREINSTALL FAILED%s - see details above.\n  Log: %s\n' "$RED" "$BLD" "$RST" "$LOG_FILE" ;;
-  esac
-  press_any_key
-}
 
-module_menu() {  # key title install_fn [update_fn] [reinstall_fn] [users_fn]  (CUR_INFO set by caller)
-  CUR_KEY=$1; CUR_TITLE=$2; CUR_FN=$3; CUR_UPD=${4:-}; CUR_REI=${5:-}; CUR_USR=${6:-}; MSG=""
+module_menu() {  # key title install_fn [update_fn] [reinstall_fn] [users_fn] [uninstall_fn]  (CUR_INFO set by caller)
+  CUR_KEY=$1; CUR_TITLE=$2; CUR_FN=$3; CUR_UPD=${4:-}; CUR_REI=${5:-}; CUR_USR=${6:-}; CUR_UNI=${7:-}; MSG=""
   local first=1
   while true; do
     REDRAW=draw_module_menu
@@ -866,6 +1013,7 @@ module_menu() {  # key title install_fn [update_fn] [reinstall_fn] [users_fn]  (
       3) if [ -n "$CUR_UPD" ]; then run_update; else MSG="Invalid option '3'. Use the numbers shown, B or 0."; fi ;;
       4) if [ -n "$CUR_REI" ]; then run_reinstall; else MSG="Invalid option '4'. Use the numbers shown, B or 0."; fi ;;
       5) if [ -n "$CUR_USR" ]; then "$CUR_USR"; else MSG="Invalid option '5'. Use the numbers shown, B or 0."; fi ;;
+      6) if [ -n "$CUR_UNI" ]; then run_uninstall; else MSG="Invalid option '6'. Use the numbers shown, B or 0."; fi ;;
       b|B) return 0 ;;
       0|q|Q) do_exit ;;
       $'\e') drain_esc; MSG="Invalid input. Use the numbers shown, B or 0." ;;
@@ -883,6 +1031,9 @@ install_bvm_bot() {
   if [ -e "$BOT_DIR" ]; then
     printf '  %s%s%s Existing copy found: %s\n' "$YEL" "$WRN" "$RST" "$BOT_DIR"
     ask_yn "Update it (git pull) and re-run its install.sh? Existing files may change." || return 2
+    ABORT_MSG="Update cancelled - run Update again to finish it. Your data was kept."
+  else
+    ROLLBACK_FN=rb_fresh_bot     # nothing existed before: Ctrl+C removes the half-done copy again
   fi
   printf '\n'
   stage "Preflight: disk & network" preflight "https://github.com" || return 1
@@ -901,6 +1052,7 @@ update_bvm_bot() {
   printf '  %sThe latest code is pulled (git pull); your bot data and config files are kept.%s\n' "$DIM" "$RST"
   printf '  %sIts install.sh runs again to apply the update.%s\n\n' "$DIM" "$RST"
   ask_yn "Update BVM VPS BOT now?" || return 2
+  ABORT_MSG="Update cancelled - run Update again to finish it. Your data was kept."
   printf '\n'
   stage "Preflight: disk & network" preflight "https://github.com" || return 1
   stage "Checking git" ensure_git || return 1
@@ -910,11 +1062,11 @@ update_bvm_bot() {
   mark_installed bvm-bot
   return 0
 }
-bvm_remove_copy() {   # backup the old folder (config/data may live in it), then delete it
+bvm_remove_copy() {   # backup ($1) the old folder (config/data may live in it), then delete it
   [ -d "$BOT_DIR" ] || { echo "no old copy found"; return 0; }
-  local b="$STATE_DIR/bvm-bot-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  local b=$1
   mkdir -p "$STATE_DIR" || return 1
-  tar -czf "$b" -C "$(dirname "$BOT_DIR")" "$(basename "$BOT_DIR")" 2>>"$LOG_FILE" || { echo "backup failed - nothing was deleted"; return 1; }
+  tar -czf "$b" -C "$(dirname "$BOT_DIR")" "$(basename "$BOT_DIR")" 2>>"$LOG_FILE" || { rm -f "$b"; echo "backup failed - nothing was deleted"; return 1; }
   chmod 600 "$b"
   rm -rf "${BOT_DIR:?}" || return 1
   echo "old copy removed, backup: $b"
@@ -927,11 +1079,31 @@ reinstall_bvm_bot() {
   printf '\n'
   stage "Preflight: disk & network" preflight "https://github.com" || return 1
   stage "Checking git" ensure_git || return 1
-  stage "Removing old copy (with backup)" bvm_remove_copy || return 1
+  RB_DIR=$BOT_DIR; RB_BACKUP="$STATE_DIR/bvm-bot-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  ROLLBACK_FN=rb_restore_backup   # Ctrl+C from here on puts the old copy back
+  ABORT_MSG="Reinstall cancelled - your old copy was restored from the backup."
+  stage "Removing old copy (with backup)" bvm_remove_copy "$RB_BACKUP" || return 1
   stage "Fetching Bvm-v1bot repository" git_fetch_repo "$BOT_REPO" "$BOT_DIR" || return 1
   stage "Validating install.sh" validate_script "$BOT_DIR/install.sh" || return 1
   stage_fg "Running install.sh" run_bot_installer || return 1
   mark_installed bvm-bot
+  return 0
+}
+uninstall_bvm_bot() {
+  STAGE_TOTAL=3; STAGE_DONE=0
+  ABORT_MSG="Uninstall was interrupted - run Uninstall again to finish."
+  if [ ! -e "$BOT_DIR" ] && [ ! -f "$STATE_DIR/bvm-bot.installed" ]; then
+    printf '  %s%s%s BVM VPS BOT is not installed - nothing to remove.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sThis stops the bot and DELETES %s with all its config and data.%s\n' "$DIM" "$BOT_DIR" "$RST"
+  printf '  %sVPS/containers it created and system packages its installer added are not touched.%s\n\n' "$DIM" "$RST"
+  ask_yn "Uninstall BVM VPS BOT now?" || return 2
+  ask_yn "Are you sure? Everything of the bot is lost forever." || return 2
+  if ask_yn "Also delete its old backups in $STATE_DIR?"; then UNI_BACKUPS=1; else UNI_BACKUPS=0; fi
+  printf '\n'
+  stage "Stopping bot (services, processes)" app_stop "$BOT_DIR" || return 1
+  stage "Deleting bot files and data" app_remove_dir "$BOT_DIR" || return 1
+  stage "Cleaning leftovers" uni_leftovers bvm-bot || return 1
   return 0
 }
 module_bvm_bot() {
@@ -940,8 +1112,9 @@ module_bvm_bot() {
             "Steps  : git clone, validate, run install.sh"
             "Update : [3] pulls the latest code and re-applies it"
             "Reinst : [4] fresh copy (old folder is backed up)"
+            "Uninst : [6] removes the bot completely"
             "Needs  : root, git (auto-installed), internet")
-  module_menu bvm-bot "BVM VPS BOT" install_bvm_bot update_bvm_bot reinstall_bvm_bot
+  module_menu bvm-bot "BVM VPS BOT" install_bvm_bot update_bvm_bot reinstall_bvm_bot "" uninstall_bvm_bot
 }
 
 # ============================================================================
@@ -979,6 +1152,9 @@ install_bvm_panel() {
   if [ -e "$BVMP_DIR" ]; then
     printf '  %s%s%s Existing copy found: %s\n' "$YEL" "$WRN" "$RST" "$BVMP_DIR"
     ask_yn "Update it from the zip and re-run its install.sh? Existing files may change." || return 2
+    ABORT_MSG="Update cancelled - run Update again to finish it. Your data was kept."
+  else
+    ROLLBACK_FN=rb_fresh_bvmp    # nothing existed before: Ctrl+C removes the half-done copy again
   fi
   printf '\n'
   stage "Preflight: disk & network" preflight "$BVMP_ZIP_URL" || return 1
@@ -995,6 +1171,7 @@ update_bvm_panel() {
   fi
   printf '  %sThe latest zip is downloaded; your panel data and config files are kept.%s\n\n' "$DIM" "$RST"
   ask_yn "Update BVM PANEL now?" || return 2
+  ABORT_MSG="Update cancelled - run Update again to finish it. Your data was kept."
   printf '\n'
   stage "Preflight: disk & network" preflight "$BVMP_ZIP_URL" || return 1
   stage "Downloading latest BVM Panel (zip)" bvmp_fetch_zip || return 1
@@ -1003,11 +1180,11 @@ update_bvm_panel() {
   mark_installed bvm-panel
   return 0
 }
-bvmp_remove_copy() {   # backup the old folder, then delete it
+bvmp_remove_copy() {   # backup ($1) the old folder, then delete it
   [ -d "$BVMP_DIR" ] || { echo "no old copy found"; return 0; }
-  local b="$STATE_DIR/bvm-panel-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  local b=$1
   mkdir -p "$STATE_DIR" || return 1
-  tar -czf "$b" -C "$(dirname "$BVMP_DIR")" "$(basename "$BVMP_DIR")" 2>>"$LOG_FILE" || { echo "backup failed - nothing was deleted"; return 1; }
+  tar -czf "$b" -C "$(dirname "$BVMP_DIR")" "$(basename "$BVMP_DIR")" 2>>"$LOG_FILE" || { rm -f "$b"; echo "backup failed - nothing was deleted"; return 1; }
   chmod 600 "$b"
   rm -rf "${BVMP_DIR:?}" || return 1
   echo "old copy removed, backup: $b"
@@ -1019,11 +1196,31 @@ reinstall_bvm_panel() {
   ask_yn "Reinstall BVM PANEL now?" || return 2
   printf '\n'
   stage "Preflight: disk & network" preflight "$BVMP_ZIP_URL" || return 1
-  stage "Removing old copy (with backup)" bvmp_remove_copy || return 1
+  RB_DIR=$BVMP_DIR; RB_BACKUP="$STATE_DIR/bvm-panel-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  ROLLBACK_FN=rb_restore_backup   # Ctrl+C from here on puts the old copy back
+  ABORT_MSG="Reinstall cancelled - your old copy was restored from the backup."
+  stage "Removing old copy (with backup)" bvmp_remove_copy "$RB_BACKUP" || return 1
   stage "Downloading BVM Panel (zip)" bvmp_fetch_zip || return 1
   stage "Validating install.sh" validate_script "$BVMP_DIR/install.sh" || return 1
   stage_fg "Running install.sh" run_bvmp_installer || return 1
   mark_installed bvm-panel
+  return 0
+}
+uninstall_bvm_panel() {
+  STAGE_TOTAL=3; STAGE_DONE=0
+  ABORT_MSG="Uninstall was interrupted - run Uninstall again to finish."
+  if [ ! -e "$BVMP_DIR" ] && [ ! -f "$STATE_DIR/bvm-panel.installed" ]; then
+    printf '  %s%s%s BVM PANEL is not installed - nothing to remove.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sThis stops the panel and DELETES %s with all its config and data.%s\n' "$DIM" "$BVMP_DIR" "$RST"
+  printf '  %sSystem packages its installer added are not touched.%s\n\n' "$DIM" "$RST"
+  ask_yn "Uninstall BVM PANEL now?" || return 2
+  ask_yn "Are you sure? Everything of the panel is lost forever." || return 2
+  if ask_yn "Also delete its old backups in $STATE_DIR?"; then UNI_BACKUPS=1; else UNI_BACKUPS=0; fi
+  printf '\n'
+  stage "Stopping panel (services, processes)" app_stop "$BVMP_DIR" || return 1
+  stage "Deleting panel files and data" app_remove_dir "$BVMP_DIR" || return 1
+  stage "Cleaning leftovers" uni_leftovers bvm-panel || return 1
   return 0
 }
 module_bvm_panel() {
@@ -1032,8 +1229,9 @@ module_bvm_panel() {
             "Steps  : download zip, validate, run install.sh"
             "Update : [3] downloads the latest zip and re-applies it"
             "Reinst : [4] fresh copy (old folder is backed up)"
+            "Uninst : [6] removes the panel completely"
             "Needs  : root, unzip (auto-installed), internet")
-  module_menu bvm-panel "BVM PANEL" install_bvm_panel update_bvm_panel reinstall_bvm_panel
+  module_menu bvm-panel "BVM PANEL" install_bvm_panel update_bvm_panel reinstall_bvm_panel "" uninstall_bvm_panel
 }
 
 # ============================================================================
@@ -1140,11 +1338,13 @@ panel_admin() {
   printf '  %s%sCreate your admin account%s\n  %s(you will sign in to the panel with this email and password)%s\n\n' "$P" "$BLD" "$RST" "$DIM" "$RST"
   while true; do
     printf '  %sAdmin email (gmail):%s ' "$WHT" "$RST" >/dev/tty;                       IFS= read -r email </dev/tty
+    (( ABORT )) && return 130
     email=$(printf '%s' "$email" | tr -d '[:space:]')
     [ -n "$email" ] || { printf '  %sEmail is required.%s\n' "$YEL" "$RST"; continue; }
     [[ $email =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || { printf '  %sThat does not look like a valid email address.%s\n' "$YEL" "$RST"; continue; }
     printf '  %sPassword (10+ characters, letters + numbers):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -rs pw </dev/tty;  printf '\n' >/dev/tty
     printf '  %sPassword again:%s ' "$WHT" "$RST" >/dev/tty;                            IFS= read -rs pw2 </dev/tty; printf '\n' >/dev/tty
+    (( ABORT )) && return 130
     [ "$pw" = "$pw2" ] || { printf '  %sThe two passwords do not match. Try again.%s\n\n' "$YEL" "$RST"; continue; }
     if (( ${#pw} < 10 )) || [[ ! $pw =~ [A-Za-z] ]] || [[ ! $pw =~ [0-9] ]]; then
       printf '  %sPassword must be 10+ characters and contain both letters and numbers. Try again.%s\n\n' "$YEL" "$RST"; continue
@@ -1219,6 +1419,9 @@ update_mine_panel() {
   printf '  %sYour database, users, servers, bots, files and .env are kept.%s\n' "$DIM" "$RST"
   printf '  %sThe panel restarts for a few seconds (running servers restart with it).%s\n\n' "$DIM" "$RST"
   ask_yn "Update Mine Panel now?" || return 2
+  rm -f "$STATE_DIR/panel-last-backup"
+  ROLLBACK_FN=rb_panel_update
+  ABORT_MSG="Update cancelled - the previous version was restored and started. Your data was kept."
   printf '\n'
   stage "Preflight: disk & network" preflight "$PANEL_ZIP_URL" || return 1
   stage "Downloading new version (zip)" panel_fetch_zip || return 1          # live panel is still untouched here
@@ -1242,6 +1445,11 @@ install_mine_panel() {
   if (( update )); then
     printf '  %s%s%s Mine Panel is already installed - this will UPDATE it.\n' "$YEL" "$WRN" "$RST"
     ask_yn "Update now? Your data, servers and admin login are kept." || return 2
+    ABORT_MSG="Update cancelled - run Install again to finish it. Your data was kept."
+  else
+    RB_HOME_PRE=0; [ -e "$PANEL_HOME" ] && RB_HOME_PRE=1
+    RB_USER_PRE=0; id minepanel >/dev/null 2>&1 && RB_USER_PRE=1
+    ROLLBACK_FN=rb_mine_panel_fresh      # Ctrl+C removes the half-done install again
   fi
   printf '\n'
   stage "Preflight: disk & network" preflight "$PANEL_ZIP_URL" || return 1
@@ -1301,6 +1509,9 @@ reinstall_mine_panel() {
   stage "Downloading Mine Panel (zip)" panel_fetch_zip || return 1        # live panel is untouched until here
   stage "Checking panel files" panel_check_src || return 1
   stage "Installing Node.js, Python, Java" panel_deps || return 1
+  rm -f "$STATE_DIR/panel-last-backup"
+  ROLLBACK_FN=rb_panel_reinstall
+  ABORT_MSG="Reinstall cancelled - the previous panel was restored."
   stage "Removing old panel" panel_reinstall_remove || return 1
   stage "Installing panel files" panel_files || return 1
   stage "Starting panel service" panel_service || return 1
@@ -1436,17 +1647,20 @@ mp_user_create() {
   printf '\n'
   while true; do
     printf '  %sEmail (gmail):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -r email </dev/tty
+    (( ABORT )) && return 130
     email=$(printf '%s' "$email" | tr -d '[:space:]')
     [ -n "$email" ] || { printf '  %sEmail is required.%s\n' "$YEL" "$RST"; continue; }
     [[ $email =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || { printf '  %sThat does not look like a valid email address.%s\n' "$YEL" "$RST"; continue; }
     if mp_users_run list | cut -f3 | grep -qix -- "$email"; then printf '  %sThis email already has an account.%s\n' "$YEL" "$RST"; continue; fi
     printf '  %sPassword (10+ characters, letters + numbers):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -rs pw </dev/tty; printf '\n' >/dev/tty
+    (( ABORT )) && return 130
     if (( ${#pw} < 10 )) || [[ ! $pw =~ [A-Za-z] ]] || [[ ! $pw =~ [0-9] ]]; then
       printf '  %sPassword must be 10+ characters and contain both letters and numbers. Try again.%s\n\n' "$YEL" "$RST"; continue
     fi
     user=$(printf '%s' "${email%%@*}" | tr -c 'A-Za-z0-9_-' '_'); user=${user:0:20}
     [ "${#user}" -ge 3 ] || user="user${RANDOM}"
     for try in 1 2 3; do
+      (( admin )) || { RB_TMAIL=$email; ROLLBACK_FN=rb_tmp_user; }    # created as admin first: Ctrl+C must not leave it as one
       if out=$( cd "$PANEL_HOME" && runuser -u minepanel -- env ADMIN_PASSWORD="$pw" node $PANEL_NODE_FLAGS scripts/create-admin.js "$email" "$user" 2>&1 ); then
         if (( ! admin )); then
           if ! out=$(mp_users_run setrole "$email" user); then
@@ -1455,6 +1669,7 @@ mp_user_create() {
             return 1
           fi
         fi
+        ROLLBACK_FN=""
         printf '  %s%s%s User created: %s  (%s)\n' "$GRN" "$OK" "$RST" "$email" "$role"
         return 0
       fi
@@ -1472,6 +1687,7 @@ mp_user_delete() {
   local email out
   mp_users_show || return 1
   printf '\n  %sEmail of the user to delete (empty = cancel):%s ' "$WHT" "$RST" >/dev/tty; IFS= read -r email </dev/tty
+    (( ABORT )) && return 130
   email=$(printf '%s' "$email" | tr -d '[:space:]')
   [ -n "$email" ] || { printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST"; return 2; }
   mp_users_run list | cut -f3 | grep -qix -- "$email" || { printf '  %s%s%s No user with that email.\n' "$YEL" "$WRN" "$RST"; return 1; }
@@ -1518,6 +1734,7 @@ mp_user_resetpw() {
   # The panel's own create-admin.js hashes the password (so the hash format always matches the panel);
   # that hash is copied to the real user and the temporary helper user is removed again.
   tuser="mfxr${RANDOM}${RANDOM}"; tmail="${tuser}@example.com"
+  RB_TMAIL=$tmail; ROLLBACK_FN=rb_tmp_user      # the temporary helper user must never stay behind after Ctrl+C
   if ! out=$( cd "$PANEL_HOME" && runuser -u minepanel -- env ADMIN_PASSWORD="$pw" node $PANEL_NODE_FLAGS scripts/create-admin.js "$tmail" "$tuser" 2>&1 ); then
     printf '  %s%s%s\n' "$RED" "$(printf '%s' "$out" | tail -n1)" "$RST"; return 1
   fi
@@ -1543,7 +1760,7 @@ run_user_action() {  # title fn
   header_small "$1"
   box_bot
   printf '\n'
-  "$2"
+  op_call "$2"
   press_any_key
 }
 
@@ -1582,6 +1799,91 @@ module_panel_users() {
   done
 }
 
+# ---- Uninstall: removes the panel, ALL its data and its system user ----------------------------------------
+mp_remove_service() {
+  systemctl stop minepanel >>"$LOG_FILE" 2>&1 || true
+  systemctl disable minepanel >>"$LOG_FILE" 2>&1 || true
+  rm -f /etc/systemd/system/minepanel.service
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+  if id minepanel >/dev/null 2>&1; then          # servers and bots run as this user
+    pkill -TERM -u minepanel >/dev/null 2>&1 && sleep 2
+    pkill -KILL -u minepanel >/dev/null 2>&1
+  fi
+  echo "service and all panel processes stopped"
+  return 0
+}
+mp_remove_files() { app_remove_dir "$PANEL_HOME" && app_remove_dir "$PANEL_DIR"; }
+mp_remove_user() {
+  id minepanel >/dev/null 2>&1 || { echo "no system user to remove"; return 0; }
+  userdel -f minepanel >>"$LOG_FILE" 2>&1 || userdel minepanel >>"$LOG_FILE" 2>&1 || { echo "could not remove user minepanel (see log)"; return 1; }
+  echo "user minepanel removed"
+}
+
+rb_mine_panel_fresh() {   # Ctrl+C during a first install: remove what this run created
+  mp_remove_service
+  rm -rf "${PANEL_DIR:?}"
+  if (( ! RB_HOME_PRE )); then
+    app_remove_dir "$PANEL_HOME"
+    (( RB_USER_PRE )) || mp_remove_user
+  fi
+  rm -f "$STATE_DIR/mine-panel.installed"
+  rmdir "$INSTALL_ROOT" 2>/dev/null
+  echo "half-done install removed"
+  return 0
+}
+
+rb_panel_update() {   # Ctrl+C during an update: old code back (if it was being replaced), panel running again
+  local b; b=$(cat "$STATE_DIR/panel-last-backup" 2>/dev/null)
+  if [ -n "$b" ] && [ -f "$b/state.tar" ]; then
+    panel_rollback && echo "previous version restored and started"
+  else
+    systemctl start minepanel >>"$LOG_FILE" 2>&1
+    echo "panel started again, nothing was replaced"
+  fi
+  return 0
+}
+
+rb_panel_reinstall() {   # Ctrl+C during a reinstall: bring the old panel (code + service) back
+  local b d; b=$(cat "$STATE_DIR/panel-last-backup" 2>/dev/null)
+  if (( PANEL_WIPE )) && [ ! -f "$PANEL_HOME/data/.admin-created" ]; then
+    rb_mine_panel_fresh      # data is already wiped and the new install is incomplete: nothing to go back to
+    echo "wiped install cancelled - Mine Panel removed, run Install again"
+    return 0
+  fi
+  if [ -n "$b" ] && [ -f "$b/state.tar" ]; then
+    for d in src public scripts deploy tests; do rm -rf "${PANEL_HOME:?}/$d"; done
+    ( cd "$PANEL_HOME" && tar -xf "$b/state.tar" --exclude=./.env --exclude=./data )
+    chown -R minepanel:minepanel "$PANEL_HOME" 2>/dev/null
+  fi
+  if [ -f "$PANEL_HOME/deploy/minepanel.service" ]; then
+    cp "$PANEL_HOME/deploy/minepanel.service" /etc/systemd/system/minepanel.service
+    systemctl daemon-reload >>"$LOG_FILE" 2>&1
+    systemctl enable minepanel >>"$LOG_FILE" 2>&1
+    systemctl restart minepanel >>"$LOG_FILE" 2>&1
+  fi
+  echo "previous panel restored"
+  return 0
+}
+
+uninstall_mine_panel() {
+  STAGE_TOTAL=4; STAGE_DONE=0
+  ABORT_MSG="Uninstall was interrupted - run Uninstall again to finish."
+  if [ ! -e "$PANEL_HOME" ] && [ ! -f /etc/systemd/system/minepanel.service ] && ! id minepanel >/dev/null 2>&1; then
+    printf '  %s%s%s Mine Panel is not installed - nothing to remove.\n' "$YEL" "$WRN" "$RST"; return 1
+  fi
+  printf '  %sThis stops the panel and DELETES %s:%s\n' "$RED" "$PANEL_HOME" "$RST"
+  printf '  %sdatabase, users, Minecraft servers + worlds, bots, files and update backups.%s\n' "$RED" "$RST"
+  printf '  %sNode.js, Python and Java stay installed (other programs may use them).%s\n\n' "$DIM" "$RST"
+  ask_yn "Uninstall Mine Panel now?" || return 2
+  ask_yn "Are you absolutely sure? ALL panel data is lost forever." || return 2
+  printf '\n'
+  stage "Stopping panel + its processes" mp_remove_service || return 1
+  stage "Deleting panel files and data" mp_remove_files || return 1
+  stage "Removing system user" mp_remove_user || return 1
+  stage "Cleaning leftovers" uni_leftovers mine-panel || return 1
+  return 0
+}
+
 module_mine_panel() {
   CUR_INFO=("Mine Panel (Minecraft + Bot hosting)"
             "Source : $PANEL_ZIP_URL"
@@ -1589,8 +1891,9 @@ module_mine_panel() {
             "Last   : asks the admin email + password"
             "Update : menu [3] keeps all your data"
             "Reinst : [4] fresh install (data kept unless you choose to wipe)"
-            "Users  : [5] create / delete / view / reset password")
-  module_menu mine-panel "MINE PANEL" install_mine_panel update_mine_panel reinstall_mine_panel module_panel_users
+            "Users  : [5] create / delete / view / reset password"
+            "Uninst : [6] removes panel, data and system user")
+  module_menu mine-panel "MINE PANEL" install_mine_panel update_mine_panel reinstall_mine_panel module_panel_users uninstall_mine_panel
 }
 
 # ============================================================================
@@ -1745,6 +2048,8 @@ install_cloudflare() {
   if cf_service_exists; then
     printf '  %s%s%s A Cloudflare tunnel service already exists on this VPS.\n' "$YEL" "$WRN" "$RST"
     ask_yn "Replace it with a new token?" || return 2
+  elif ! cf_installed; then
+    ROLLBACK_FN=rb_cf_fresh      # first install: Ctrl+C removes cloudflared + repo again
   fi
   printf '\n'
   stage    "Preflight: disk & network"  preflight "https://pkg.cloudflare.com/cloudflare-public-v2.gpg" || return 1
@@ -1766,6 +2071,7 @@ reinstall_cloudflare() {
   printf '  %sThis removes cloudflared and the tunnel service, then installs everything again.%s\n' "$DIM" "$RST"
   printf '  %sYou need your Cloudflare tunnel token (asked first, before anything is removed).%s\n' "$DIM" "$RST"
   ask_yn "Reinstall Cloudflare now?" || return 2
+  ABORT_MSG="Reinstall cancelled - Cloudflare may be removed now. Use [1] Install to set it up again."
   printf '\n'
   stage    "Preflight: disk & network"   preflight "https://pkg.cloudflare.com/cloudflare-public-v2.gpg" || return 1
   stage_fg "Tunnel token"                cf_ask_token   || { CF_TOKEN=""; return 1; }
@@ -1797,10 +2103,10 @@ cf_service_remove() {
 cf_pkg_remove() {
   export DEBIAN_FRONTEND=noninteractive
   case $PM in
-    apt)     apt-get remove -y cloudflared >>"$LOG_FILE" 2>&1 || { echo "package removal failed (see log)"; return 1; } ;;
-    dnf|yum) "$PM" remove -y cloudflared >>"$LOG_FILE" 2>&1   || { echo "package removal failed (see log)"; return 1; } ;;
+    apt)     if dpkg -s cloudflared >/dev/null 2>&1; then apt-get purge -y cloudflared >>"$LOG_FILE" 2>&1 || { echo "package removal failed (see log)"; return 1; }; fi ;;
+    dnf|yum) if rpm -q cloudflared >/dev/null 2>&1; then "$PM" remove -y cloudflared >>"$LOG_FILE" 2>&1 || { echo "package removal failed (see log)"; return 1; }; fi ;;
   esac
-  rm -f /usr/local/bin/cloudflared   # manual installs
+  rm -f /usr/local/bin/cloudflared   # manual (binary) installs
   echo "cloudflared removed"
 }
 
@@ -1811,8 +2117,17 @@ cf_clean() {
   echo "repo, key and /etc/cloudflared cleaned"
 }
 
+cf_clean_full() {   # everything cf_clean does + the login/credential folders cloudflared leaves in the home directory
+  cf_clean
+  rm -rf /root/.cloudflared "${HOME:-/root}/.cloudflared"
+  echo "repo, key, /etc/cloudflared and ~/.cloudflared cleaned"
+}
+
+rb_cf_fresh() { cf_service_remove; cf_pkg_remove; cf_clean; echo "half-done install removed"; return 0; }
+
 uninstall_cloudflare() {
   STAGE_TOTAL=3; STAGE_DONE=0
+  ABORT_MSG="Uninstall was interrupted - run Uninstall again to finish."
   if ! cf_installed && ! cf_service_exists; then
     printf '  %s%s%s Cloudflare is not installed - nothing to remove.\n' "$YEL" "$WRN" "$RST"; return 1
   fi
@@ -1822,7 +2137,7 @@ uninstall_cloudflare() {
   printf '\n'
   stage "Removing tunnel service"     cf_service_remove || return 1
   stage "Removing cloudflared"        cf_pkg_remove     || return 1
-  stage "Cleaning repo and config"    cf_clean          || return 1
+  stage "Cleaning repo and config"    cf_clean_full     || return 1
   return 0
 }
 
@@ -1832,12 +2147,13 @@ run_cf_action() {  # title fn success_message
   box_row "Log: $LOG_FILE" "$DIM"
   box_bot
   log "=== BEGIN $1 ==="
-  "$2"; local rc=$?
+  op_call "$2"; local rc=$?
   log "=== END $1 rc=$rc ==="
   printf '\n'
   case $rc in
     0) box_top; box_center "$3" "$GRN$BLD"; box_row "Log: $LOG_FILE" "$DIM"; box_bot ;;
     2) printf '  %s%s Cancelled - nothing was changed.%s\n' "$YEL" "$WRN" "$RST" ;;
+    130) ;;   # Ctrl+C: op_call already cleaned up and explained what happened
     *) printf '  %s%sFAILED%s - see details above.\n  Log: %s\n' "$RED" "$BLD" "$RST" "$LOG_FILE" ;;
   esac
   press_any_key
@@ -1999,7 +2315,8 @@ main_menu() {
 # ----------------------------------------------------------------------------
 main() {
   trap cleanup EXIT
-  trap 'exit 130' INT TERM
+  trap on_int INT                  # Ctrl+C: cancels the running operation (or leaves the menus)
+  trap 'exit 143' TERM
   trap 'RESIZED=1' WINCH
   setup_locale
   setup_theme
